@@ -10,9 +10,7 @@ def _request() -> ContextRequest:
         user_id=None,
         session_id=None,
         token_budget=None,
-        enable_compaction=False,
-        enable_rlm=False,
-        enable_filter=True,
+        steps=("filter",),
     )
 
 

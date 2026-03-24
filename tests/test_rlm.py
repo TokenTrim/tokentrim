@@ -21,9 +21,7 @@ def _request(*, user_id: str | None, session_id: str | None) -> ContextRequest:
         user_id=user_id,
         session_id=session_id,
         token_budget=None,
-        enable_compaction=False,
-        enable_rlm=True,
-        enable_filter=False,
+        steps=("rlm",),
     )
 
 

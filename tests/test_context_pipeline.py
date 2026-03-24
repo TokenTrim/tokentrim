@@ -6,6 +6,7 @@ from tokentrim.context.base import ContextStep
 from tokentrim.context.pipeline import ContextPipeline
 from tokentrim.context.request import ContextRequest
 from tokentrim.context.store import NoOpMemoryStore
+from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
 
 
@@ -14,6 +15,10 @@ class RecorderStep(ContextStep):
         self._name = name
         self._marker = marker
         self._calls = calls
+
+    @property
+    def name(self) -> str:
+        return self._name
 
     def run(self, messages, request):
         del request
@@ -27,18 +32,18 @@ def test_pipeline_runs_steps_in_order() -> None:
         tokenizer_model=None,
         compaction_model=None,
         memory_store=NoOpMemoryStore(),
+        steps=(
+            RecorderStep("filter", "filter", calls),
+            RecorderStep("compaction", "compaction", calls),
+            RecorderStep("rlm", "rlm", calls),
+        ),
     )
-    pipeline._filter = RecorderStep("filter", "filter", calls)
-    pipeline._compaction = RecorderStep("compaction", "compaction", calls)
-    pipeline._rlm = RecorderStep("rlm", "rlm", calls)
     request = ContextRequest(
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
         token_budget=1000,
-        enable_compaction=True,
-        enable_rlm=True,
-        enable_filter=True,
+        steps=("filter", "compaction", "rlm"),
     )
 
     result = pipeline.run(request)
@@ -46,6 +51,11 @@ def test_pipeline_runs_steps_in_order() -> None:
     assert calls == ["filter", "compaction", "rlm"]
     assert [message["content"] for message in result.messages] == [
         "hello",
+        "filter",
+        "compaction",
+        "rlm",
+    ]
+    assert [trace.step_name for trace in result.step_traces] == [
         "filter",
         "compaction",
         "rlm",
@@ -61,18 +71,18 @@ def test_pipeline_skips_disabled_steps() -> None:
         tokenizer_model=None,
         compaction_model=None,
         memory_store=NoOpMemoryStore(),
+        steps=(
+            RecorderStep("filter", "filter", calls),
+            RecorderStep("compaction", "compaction", calls),
+            RecorderStep("rlm", "rlm", calls),
+        ),
     )
-    pipeline._filter = RecorderStep("filter", "filter", calls)
-    pipeline._compaction = RecorderStep("compaction", "compaction", calls)
-    pipeline._rlm = RecorderStep("rlm", "rlm", calls)
     request = ContextRequest(
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
         token_budget=1000,
-        enable_compaction=False,
-        enable_rlm=False,
-        enable_filter=True,
+        steps=("filter",),
     )
 
     pipeline.run(request)
@@ -93,9 +103,7 @@ def test_pipeline_does_not_mutate_input_messages() -> None:
         user_id=None,
         session_id=None,
         token_budget=None,
-        enable_compaction=False,
-        enable_rlm=False,
-        enable_filter=True,
+        steps=("filter",),
     )
 
     pipeline.run(request)
@@ -115,9 +123,7 @@ def test_pipeline_result_is_independent_from_input_dicts() -> None:
         user_id=None,
         session_id=None,
         token_budget=None,
-        enable_compaction=False,
-        enable_rlm=False,
-        enable_filter=False,
+        steps=(),
     )
 
     result = pipeline.run(request)
@@ -137,12 +143,30 @@ def test_pipeline_raises_when_final_budget_is_exceeded() -> None:
         user_id=None,
         session_id=None,
         token_budget=5,
-        enable_compaction=False,
-        enable_rlm=False,
-        enable_filter=False,
+        steps=(),
     )
 
     with pytest.raises(BudgetExceededError) as exc_info:
         pipeline.run(request)
 
     assert exc_info.value.actual > exc_info.value.budget
+
+
+def test_pipeline_raises_for_unknown_steps() -> None:
+    pipeline = ContextPipeline(
+        tokenizer_model=None,
+        compaction_model=None,
+        memory_store=NoOpMemoryStore(),
+    )
+    request = ContextRequest(
+        messages=({"role": "user", "content": "hello"},),
+        user_id=None,
+        session_id=None,
+        token_budget=None,
+        steps=("unknown",),
+    )
+
+    with pytest.raises(TokentrimError) as exc_info:
+        pipeline.run(request)
+
+    assert "Unknown context steps requested" in str(exc_info.value)

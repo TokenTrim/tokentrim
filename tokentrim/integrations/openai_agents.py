@@ -30,9 +30,7 @@ class OpenAIAgentsOptions:
     user_id: str | None = None
     session_id: str | None = None
     token_budget: int | None = None
-    enable_compaction: bool = False
-    enable_rlm: bool = False
-    enable_filter: bool = False
+    steps: tuple[str, ...] = ()
     apply_to_session_history: bool = True
     apply_to_handoffs: bool = True
 
@@ -80,12 +78,7 @@ class OpenAIAgentsAdapter(IntegrationAdapter["RunConfig"]):
 
 
 def _requires_adapter(options: OpenAIAgentsOptions) -> bool:
-    return (
-        options.token_budget is not None
-        or options.enable_compaction
-        or options.enable_rlm
-        or options.enable_filter
-    )
+    return options.token_budget is not None or bool(options.steps)
 
 
 def _load_agents_sdk() -> tuple[type[Any], type[Any], type[Any]]:
@@ -231,9 +224,7 @@ def _trim_input_items(
         user_id=options.user_id,
         session_id=options.session_id,
         token_budget=options.token_budget,
-        enable_compaction=options.enable_compaction,
-        enable_rlm=options.enable_rlm,
-        enable_filter=options.enable_filter,
+        steps=options.steps,
     )
     return [_message_to_input_item(message) for message in result.messages]
 

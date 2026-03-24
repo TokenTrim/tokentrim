@@ -12,8 +12,7 @@ def _request(*, task_hint: str | None) -> ToolsRequest:
         tools=tuple(),
         task_hint=task_hint,
         token_budget=None,
-        enable_tool_bpe=False,
-        enable_tool_creation=True,
+        steps=("creator",),
     )
 
 
@@ -41,10 +40,15 @@ def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result == [
         {
+            "name": "search",
+            "description": "search docs",
+            "input_schema": {"type": "object"},
+        },
+        {
             "name": "lookup",
             "description": "new tool",
             "input_schema": {"type": "object"},
-        }
+        },
     ]
 
 

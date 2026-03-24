@@ -5,9 +5,12 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from tokentrim import Tokentrim
+from tokentrim.context.compaction import CompactionStep
 from tokentrim.context.store import MemoryStore
 from tokentrim.integrations.base import IntegrationAdapter
+from tokentrim.tools.creator import ToolCreatorStep
 from tokentrim.types.context_result import ContextResult
+from tokentrim.types.step_trace import StepTrace
 from tokentrim.types.tools_result import ToolsResult
 
 
@@ -24,6 +27,10 @@ class EchoAdapter(IntegrationAdapter[str]):
         return config or "default"
 
 
+def _pipeline_step(steps, name):
+    return next(step for step in steps if step.name == name)
+
+
 def test_constructor_wires_per_feature_models() -> None:
     client = Tokentrim(
         model="shared-model",
@@ -31,8 +38,13 @@ def test_constructor_wires_per_feature_models() -> None:
         tool_creation_model="creator-model",
     )
 
-    assert client._context_pipeline._compaction._model == "compact-model"
-    assert client._tools_pipeline._creator._model == "creator-model"
+    compaction = _pipeline_step(client._context_pipeline._steps, "compaction")
+    creator = _pipeline_step(client._tools_pipeline._steps, "creator")
+
+    assert isinstance(compaction, CompactionStep)
+    assert isinstance(creator, ToolCreatorStep)
+    assert compaction._model == "compact-model"
+    assert creator._model == "creator-model"
     assert client._context_pipeline._tokenizer_model == "shared-model"
 
 
@@ -42,7 +54,12 @@ def test_default_token_budget_propagates_to_context_request(monkeypatch: pytest.
 
     def fake_run(request):
         captured["token_budget"] = request.token_budget
-        return ContextResult(messages=tuple(), token_count=0, trace_id="trace")
+        return ContextResult(
+            messages=tuple(),
+            step_traces=tuple(),
+            token_count=0,
+            trace_id="trace",
+        )
 
     monkeypatch.setattr(client._context_pipeline, "run", fake_run)
 
@@ -56,14 +73,19 @@ def test_memory_store_is_propagated_to_context_pipeline() -> None:
     store: MemoryStore = InMemoryStore()
     client = Tokentrim(memory_store=store)
 
-    assert client._context_pipeline._rlm._memory_store is store
+    rlm = _pipeline_step(client._context_pipeline._steps, "rlm")
+
+    assert rlm._memory_store is store
 
 
 def test_constructor_uses_shared_model_as_feature_fallback() -> None:
     client = Tokentrim(model="shared-model")
 
-    assert client._context_pipeline._compaction._model == "shared-model"
-    assert client._tools_pipeline._creator._model == "shared-model"
+    compaction = _pipeline_step(client._context_pipeline._steps, "compaction")
+    creator = _pipeline_step(client._tools_pipeline._steps, "creator")
+
+    assert compaction._model == "shared-model"
+    assert creator._model == "shared-model"
 
 
 def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,7 +96,7 @@ def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch
         captured["token_budget"] = request.token_budget
         return ToolsResult(
             tools=tuple(),
-            created_tools=tuple(),
+            step_traces=tuple(),
             token_count=0,
             trace_id="trace",
         )
@@ -139,15 +161,19 @@ def test_get_better_context_wires_filter_compaction_and_rlm(
         user_id="u1",
         session_id="s1",
         token_budget=30,
-        enable_filter=True,
-        enable_compaction=True,
-        enable_rlm=True,
+        steps=("filter", "compaction", "rlm"),
     )
 
     assert isinstance(result.messages, tuple)
+    assert isinstance(result.step_traces, tuple)
     assert result.trace_id
     assert result.messages[0] == {"role": "system", "content": "stored context"}
     assert result.messages[1] == {"role": "system", "content": "summary"}
+    assert [trace.step_name for trace in result.step_traces] == [
+        "filter",
+        "compaction",
+        "rlm",
+    ]
     assert all(message["content"].strip() for message in result.messages)
     assert result.token_count > 0
 
@@ -176,13 +202,14 @@ def test_get_better_tools_wires_bpe_and_creator(
     result = client.get_better_tools(
         tools,
         task_hint="investigate",
-        enable_tool_bpe=True,
-        enable_tool_creation=True,
+        steps=("bpe", "creator"),
     )
 
     assert isinstance(result.tools, tuple)
+    assert isinstance(result.step_traces, tuple)
     assert result.trace_id
     assert result.tools[0]["description"] == "search the docs"
-    assert [tool["name"] for tool in result.created_tools] == ["lookup"]
     assert [tool["name"] for tool in result.tools] == ["search", "lookup"]
+    assert [trace.step_name for trace in result.step_traces] == ["bpe", "creator"]
+    assert [trace.output_count - trace.input_count for trace in result.step_traces] == [0, 1]
     assert result.token_count > 0

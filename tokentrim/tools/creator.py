@@ -17,6 +17,10 @@ class ToolCreatorStep(ToolStep):
     def __init__(self, model: str | None) -> None:
         self._model = model
 
+    @property
+    def name(self) -> str:
+        return "creator"
+
     def run(self, tools: list[Tool], request: ToolsRequest) -> list[Tool]:
         if not tools and not request.task_hint:
             return []
@@ -45,7 +49,7 @@ class ToolCreatorStep(ToolStep):
             existing_names.add(tool["name"])
             created.append(tool)
 
-        return created
+        return [*tools, *created]
 
     def _generate(self, tools: list[Tool], *, task_hint: str | None) -> str:
         tool_text = json.dumps(tools, sort_keys=True)

@@ -19,6 +19,10 @@ class CompactionStep(ContextStep):
         self._model = model
         self._tokenizer_model = tokenizer_model
 
+    @property
+    def name(self) -> str:
+        return "compaction"
+
     def run(self, messages: list[Message], request: ContextRequest) -> list[Message]:
         if request.token_budget is None:
             return list(messages)

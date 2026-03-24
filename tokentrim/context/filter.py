@@ -10,6 +10,10 @@ class FilterStep(ContextStep):
     Remove low-signal messages before heavier context operations run.
     """
 
+    @property
+    def name(self) -> str:
+        return "filter"
+
     def run(self, messages: list[Message], _request: ContextRequest) -> list[Message]:
         filtered = [message for message in messages if message["content"].strip()]
         if not filtered:

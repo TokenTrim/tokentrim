@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
 from tokentrim.tools.base import ToolStep
 from tokentrim.tools.pipeline import ToolsPipeline
@@ -13,6 +14,10 @@ class RecorderStep(ToolStep):
         self._name = name
         self._description = description
         self._calls = calls
+
+    @property
+    def name(self) -> str:
+        return self._name
 
     def run(self, tools, request):
         del request
@@ -31,11 +36,15 @@ class CreatorRecorder(ToolStep):
     def __init__(self, calls: list[str]) -> None:
         self._calls = calls
 
+    @property
+    def name(self) -> str:
+        return "creator"
+
     def run(self, tools, request):
-        del tools
         del request
         self._calls.append("creator")
         return [
+            *tools,
             {
                 "name": "generated",
                 "description": "generated description",
@@ -46,9 +55,14 @@ class CreatorRecorder(ToolStep):
 
 def test_tools_pipeline_runs_steps_in_order() -> None:
     calls: list[str] = []
-    pipeline = ToolsPipeline(tokenizer_model=None, tool_creation_model=None)
-    pipeline._bpe = RecorderStep("bpe", "bpe description", calls)
-    pipeline._creator = CreatorRecorder(calls)
+    pipeline = ToolsPipeline(
+        tokenizer_model=None,
+        tool_creation_model=None,
+        steps=(
+            RecorderStep("bpe", "bpe description", calls),
+            CreatorRecorder(calls),
+        ),
+    )
     request = ToolsRequest(
         tools=(
             {
@@ -59,15 +73,15 @@ def test_tools_pipeline_runs_steps_in_order() -> None:
         ),
         task_hint="hint",
         token_budget=1000,
-        enable_tool_bpe=True,
-        enable_tool_creation=True,
+        steps=("bpe", "creator"),
     )
 
     result = pipeline.run(request)
 
     assert calls == ["bpe", "creator"]
     assert [tool["name"] for tool in result.tools] == ["base", "bpe", "generated"]
-    assert [tool["name"] for tool in result.created_tools] == ["generated"]
+    assert [trace.step_name for trace in result.step_traces] == ["bpe", "creator"]
+    assert [trace.output_count - trace.input_count for trace in result.step_traces] == [1, 1]
     assert isinstance(result.tools, tuple)
     assert result.trace_id
     assert result.token_count > 0
@@ -86,8 +100,7 @@ def test_tools_pipeline_does_not_mutate_nested_input_schema() -> None:
         tools=tuple(original),
         task_hint=None,
         token_budget=None,
-        enable_tool_bpe=True,
-        enable_tool_creation=False,
+        steps=("bpe",),
     )
 
     result = pipeline.run(request)
@@ -108,9 +121,23 @@ def test_tools_pipeline_raises_when_final_budget_is_exceeded() -> None:
         ),
         task_hint=None,
         token_budget=5,
-        enable_tool_bpe=False,
-        enable_tool_creation=False,
+        steps=(),
     )
 
     with pytest.raises(BudgetExceededError):
         pipeline.run(request)
+
+
+def test_tools_pipeline_raises_for_unknown_steps() -> None:
+    pipeline = ToolsPipeline(tokenizer_model=None, tool_creation_model=None)
+    request = ToolsRequest(
+        tools=tuple(),
+        task_hint=None,
+        token_budget=None,
+        steps=("unknown",),
+    )
+
+    with pytest.raises(TokentrimError) as exc_info:
+        pipeline.run(request)
+
+    assert "Unknown tool steps requested" in str(exc_info.value)

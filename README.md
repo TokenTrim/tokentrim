@@ -37,16 +37,13 @@ tt = Tokentrim(
 
 context_result = tt.get_better_context(
     messages,
-    enable_filter=True,
-    enable_compaction=True,
-    enable_rlm=True,
+    steps=("filter", "compaction", "rlm"),
 )
 
 tools_result = tt.get_better_tools(
     tools,
     task_hint="debug a failed database connection",
-    enable_tool_bpe=True,
-    enable_tool_creation=True,
+    steps=("bpe", "creator"),
 )
 ```
 
@@ -75,9 +72,7 @@ run_config = tt.wrap_integration(
     OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=8000,
-            enable_filter=True,
-            enable_compaction=True,
-            enable_rlm=True,
+            steps=("filter", "compaction", "rlm"),
             user_id="user-123",
             session_id="session-456",
         )

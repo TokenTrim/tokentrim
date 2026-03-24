@@ -11,7 +11,4 @@ class ContextRequest:
     user_id: str | None
     session_id: str | None
     token_budget: int | None
-    enable_compaction: bool
-    enable_rlm: bool
-    enable_filter: bool
-
+    steps: tuple[str, ...]

@@ -9,8 +9,7 @@ def _request() -> ToolsRequest:
         tools=tuple(),
         task_hint=None,
         token_budget=None,
-        enable_tool_bpe=True,
-        enable_tool_creation=False,
+        steps=("bpe",),
     )
 
 

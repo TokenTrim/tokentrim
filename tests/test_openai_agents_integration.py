@@ -36,7 +36,7 @@ def test_openai_agents_adapter_compacts_plain_text_inputs(
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=25,
-            enable_compaction=True,
+            steps=("compaction",),
         )
     ).wrap(client)
     input_items = [
@@ -73,7 +73,7 @@ def test_openai_agents_adapter_compacts_plain_text_inputs(
 
 def test_openai_agents_adapter_implements_integration_adapter() -> None:
     client = Tokentrim()
-    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(enable_filter=True))
+    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=("filter",)))
 
     wrapped = adapter.wrap(client)
 
@@ -84,7 +84,7 @@ def test_openai_agents_adapter_implements_integration_adapter() -> None:
 def test_openai_agents_adapter_chains_existing_model_filter() -> None:
     client = Tokentrim()
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(enable_filter=True)
+        options=OpenAIAgentsOptions(steps=("filter",))
     ).wrap(
         client,
         config=RunConfig(
@@ -119,7 +119,7 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
         return [*history_items, {"role": "assistant", "content": "   "}, *new_items]
 
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(enable_filter=True)
+        options=OpenAIAgentsOptions(steps=("filter",))
     ).wrap(
         client,
         config=RunConfig(session_input_callback=session_callback),
@@ -144,7 +144,7 @@ def test_openai_agents_adapter_applies_rlm_to_handoff_history() -> None:
         options=OpenAIAgentsOptions(
             user_id="u1",
             session_id="s1",
-            enable_rlm=True,
+            steps=("rlm",),
         )
     ).wrap(client)
     payload = HandoffInputData(
@@ -168,8 +168,7 @@ def test_openai_agents_adapter_preserves_rich_response_items() -> None:
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=1,
-            enable_filter=True,
-            enable_compaction=True,
+            steps=("filter", "compaction"),
         )
     ).wrap(client)
     input_items = [
@@ -199,7 +198,7 @@ def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
     client = Tokentrim()
 
     wrapped = client.wrap_integration(
-        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(enable_filter=True))
+        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=("filter",)))
     )
 
     assert isinstance(wrapped, RunConfig)

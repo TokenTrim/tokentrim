@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, TypeVar
 
 from tokentrim._copy import freeze_messages, freeze_tools
@@ -56,18 +57,14 @@ class Tokentrim:
         user_id: str | None = None,
         session_id: str | None = None,
         token_budget: int | None = None,
-        enable_compaction: bool = False,
-        enable_rlm: bool = False,
-        enable_filter: bool = False,
+        steps: Sequence[str] = (),
     ) -> ContextResult:
         request = ContextRequest(
             messages=freeze_messages(messages),
             user_id=user_id,
             session_id=session_id,
             token_budget=token_budget if token_budget is not None else self._default_token_budget,
-            enable_compaction=enable_compaction,
-            enable_rlm=enable_rlm,
-            enable_filter=enable_filter,
+            steps=tuple(steps),
         )
         return self._context_pipeline.run(request)
 
@@ -77,15 +74,13 @@ class Tokentrim:
         *,
         task_hint: str | None = None,
         token_budget: int | None = None,
-        enable_tool_bpe: bool = False,
-        enable_tool_creation: bool = False,
+        steps: Sequence[str] = (),
     ) -> ToolsResult:
         request = ToolsRequest(
             tools=freeze_tools(tools),
             task_hint=task_hint,
             token_budget=token_budget if token_budget is not None else self._default_token_budget,
-            enable_tool_bpe=enable_tool_bpe,
-            enable_tool_creation=enable_tool_creation,
+            steps=tuple(steps),
         )
         return self._tools_pipeline.run(request)
 

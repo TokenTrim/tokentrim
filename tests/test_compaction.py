@@ -17,9 +17,7 @@ def _request(*, token_budget: int | None) -> ContextRequest:
         user_id=None,
         session_id=None,
         token_budget=token_budget,
-        enable_compaction=True,
-        enable_rlm=False,
-        enable_filter=False,
+        steps=("compaction",),
     )
 
 

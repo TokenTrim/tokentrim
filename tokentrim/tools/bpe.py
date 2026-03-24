@@ -14,6 +14,10 @@ class ToolBPEStep(ToolStep):
 
     _MAX_DESCRIPTION_CHARS = 200
 
+    @property
+    def name(self) -> str:
+        return "bpe"
+
     def run(self, tools: list[Tool], _request: ToolsRequest) -> list[Tool]:
         return [self._compress(tool) for tool in tools]
 

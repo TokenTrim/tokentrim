@@ -14,6 +14,10 @@ class RLMStep(ContextStep):
     def __init__(self, memory_store: MemoryStore) -> None:
         self._memory_store = memory_store
 
+    @property
+    def name(self) -> str:
+        return "rlm"
+
     def run(self, messages: list[Message], request: ContextRequest) -> list[Message]:
         if not request.user_id or not request.session_id:
             return list(messages)
