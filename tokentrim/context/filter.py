@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from tokentrim.context.base import ContextStep
 from tokentrim.context.request import ContextRequest
 from tokentrim.types.message import Message
 
 
-class FilterStep(ContextStep):
+@dataclass(frozen=True, slots=True)
+class FilterMessages(ContextStep):
     """
     Remove low-signal messages before heavier context operations run.
     """
@@ -43,3 +46,8 @@ class FilterStep(ContextStep):
             index += run_length
 
         return result
+
+
+FilterStep = FilterMessages
+
+__all__ = ["FilterMessages", "FilterStep"]

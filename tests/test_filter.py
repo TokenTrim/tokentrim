@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from tokentrim.context.request import ContextRequest
 from tokentrim.context.filter import FilterStep
+from tokentrim.context.request import ContextRequest
 
 
 def _request() -> ContextRequest:
@@ -10,7 +10,7 @@ def _request() -> ContextRequest:
         user_id=None,
         session_id=None,
         token_budget=None,
-        steps=("filter",),
+        steps=(FilterStep(),),
     )
 
 

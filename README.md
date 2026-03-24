@@ -27,6 +27,8 @@ pip install tokentrim
 
 ```python
 from tokentrim import Tokentrim
+from tokentrim.context import CompactConversation, FilterMessages, RetrieveMemory
+from tokentrim.tools import CompressToolDescriptions, CreateTools
 
 tt = Tokentrim(
     model="gpt-4o-mini",
@@ -37,13 +39,20 @@ tt = Tokentrim(
 
 context_result = tt.get_better_context(
     messages,
-    steps=("filter", "compaction", "rlm"),
+    steps=(
+        FilterMessages(),
+        CompactConversation(model="gpt-4o-mini", keep_last=8),
+        RetrieveMemory(),
+    ),
 )
 
 tools_result = tt.get_better_tools(
     tools,
     task_hint="debug a failed database connection",
-    steps=("bpe", "creator"),
+    steps=(
+        CompressToolDescriptions(max_description_chars=160),
+        CreateTools(model="gpt-4o-mini"),
+    ),
 )
 ```
 
@@ -56,6 +65,7 @@ tools_result = tt.get_better_tools(
 from agents import Agent, Runner
 
 from tokentrim import Tokentrim
+from tokentrim.context import CompactConversation, FilterMessages, RetrieveMemory
 from tokentrim.integrations import OpenAIAgentsAdapter, OpenAIAgentsOptions
 
 tt = Tokentrim(
@@ -72,7 +82,11 @@ run_config = tt.wrap_integration(
     OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=8000,
-            steps=("filter", "compaction", "rlm"),
+            steps=(
+                FilterMessages(),
+                CompactConversation(keep_last=8),
+                RetrieveMemory(),
+            ),
             user_id="user-123",
             session_id="session-456",
         )

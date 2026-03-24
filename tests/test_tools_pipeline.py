@@ -58,10 +58,6 @@ def test_tools_pipeline_runs_steps_in_order() -> None:
     pipeline = ToolsPipeline(
         tokenizer_model=None,
         tool_creation_model=None,
-        steps=(
-            RecorderStep("bpe", "bpe description", calls),
-            CreatorRecorder(calls),
-        ),
     )
     request = ToolsRequest(
         tools=(
@@ -73,7 +69,10 @@ def test_tools_pipeline_runs_steps_in_order() -> None:
         ),
         task_hint="hint",
         token_budget=1000,
-        steps=("bpe", "creator"),
+        steps=(
+            RecorderStep("bpe", "bpe description", calls),
+            CreatorRecorder(calls),
+        ),
     )
 
     result = pipeline.run(request)
@@ -100,7 +99,7 @@ def test_tools_pipeline_does_not_mutate_nested_input_schema() -> None:
         tools=tuple(original),
         task_hint=None,
         token_budget=None,
-        steps=("bpe",),
+        steps=(RecorderStep("bpe", "bpe description", []),),
     )
 
     result = pipeline.run(request)
@@ -134,10 +133,10 @@ def test_tools_pipeline_raises_for_unknown_steps() -> None:
         tools=tuple(),
         task_hint=None,
         token_budget=None,
-        steps=("unknown",),
+        steps=(object(),),
     )
 
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Unknown tool steps requested" in str(exc_info.value)
+    assert "Tool steps must be ToolStep objects." in str(exc_info.value)

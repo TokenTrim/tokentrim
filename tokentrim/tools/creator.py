@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, replace
 
 from tokentrim._llm import generate_text
 from tokentrim.errors.base import TokentrimError
@@ -9,22 +10,34 @@ from tokentrim.tools.request import ToolsRequest
 from tokentrim.types.tool import Tool
 
 
-class ToolCreatorStep(ToolStep):
+@dataclass(frozen=True, slots=True)
+class CreateTools(ToolStep):
     """
     Ask a model to propose missing tools and return only valid additions.
     """
 
-    def __init__(self, model: str | None) -> None:
-        self._model = model
+    model: str | None = None
 
     @property
     def name(self) -> str:
         return "creator"
 
+    def resolve(
+        self,
+        *,
+        tokenizer_model: str | None = None,
+        tool_creation_model: str | None = None,
+    ) -> ToolStep:
+        del tokenizer_model
+        return replace(
+            self,
+            model=self.model if self.model is not None else tool_creation_model,
+        )
+
     def run(self, tools: list[Tool], request: ToolsRequest) -> list[Tool]:
         if not tools and not request.task_hint:
             return []
-        if not self._model:
+        if not self.model:
             raise TokentrimError(
                 "Tool creation is enabled but no tool creation model is configured."
             )
@@ -74,7 +87,7 @@ class ToolCreatorStep(ToolStep):
         ]
         try:
             return generate_text(
-                model=self._model,
+                model=self.model,
                 messages=prompt,
                 temperature=0.0,
                 response_format={"type": "json_object"},
@@ -101,3 +114,8 @@ class ToolCreatorStep(ToolStep):
             "description": description,
             "input_schema": input_schema,
         }
+
+
+ToolCreatorStep = CreateTools
+
+__all__ = ["CreateTools", "ToolCreatorStep"]

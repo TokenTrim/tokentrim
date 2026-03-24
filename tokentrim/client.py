@@ -15,7 +15,9 @@ from tokentrim.types.tool import Tool
 from tokentrim.types.tools_result import ToolsResult
 
 if TYPE_CHECKING:
+    from tokentrim.context.base import ContextStep
     from tokentrim.integrations.base import IntegrationAdapter
+    from tokentrim.tools.base import ToolStep
 
 
 AdapterConfigT = TypeVar("AdapterConfigT")
@@ -57,7 +59,7 @@ class Tokentrim:
         user_id: str | None = None,
         session_id: str | None = None,
         token_budget: int | None = None,
-        steps: Sequence[str] = (),
+        steps: Sequence[ContextStep] = (),
     ) -> ContextResult:
         request = ContextRequest(
             messages=freeze_messages(messages),
@@ -74,7 +76,7 @@ class Tokentrim:
         *,
         task_hint: str | None = None,
         token_budget: int | None = None,
-        steps: Sequence[str] = (),
+        steps: Sequence[ToolStep] = (),
     ) -> ToolsResult:
         request = ToolsRequest(
             tools=freeze_tools(tools),

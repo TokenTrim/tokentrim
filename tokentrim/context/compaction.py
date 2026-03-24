@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 from tokentrim._llm import generate_text
 from tokentrim._tokens import count_message_tokens
 from tokentrim.context.base import ContextStep
@@ -8,35 +10,52 @@ from tokentrim.errors.base import TokentrimError
 from tokentrim.types.message import Message
 
 
-class CompactionStep(ContextStep):
+@dataclass(frozen=True, slots=True)
+class CompactConversation(ContextStep):
     """
     Summarise older messages into one system message when over budget.
     """
 
-    _RECENT_MESSAGES_TO_KEEP = 6
-
-    def __init__(self, model: str | None, tokenizer_model: str | None) -> None:
-        self._model = model
-        self._tokenizer_model = tokenizer_model
+    model: str | None = None
+    keep_last: int = 6
+    tokenizer_model: str | None = None
 
     @property
     def name(self) -> str:
         return "compaction"
 
+    def resolve(
+        self,
+        *,
+        tokenizer_model: str | None = None,
+        compaction_model: str | None = None,
+        memory_store=None,
+    ) -> ContextStep:
+        del memory_store
+        return replace(
+            self,
+            model=self.model if self.model is not None else compaction_model,
+            tokenizer_model=(
+                self.tokenizer_model if self.tokenizer_model is not None else tokenizer_model
+            ),
+        )
+
     def run(self, messages: list[Message], request: ContextRequest) -> list[Message]:
+        if self.keep_last < 1:
+            raise TokentrimError("Compaction keep_last must be at least 1.")
         if request.token_budget is None:
             return list(messages)
-        if len(messages) <= self._RECENT_MESSAGES_TO_KEEP:
+        if len(messages) <= self.keep_last:
             return list(messages)
-        if count_message_tokens(messages, self._tokenizer_model) <= request.token_budget:
+        if count_message_tokens(messages, self.tokenizer_model) <= request.token_budget:
             return list(messages)
-        if not self._model:
+        if not self.model:
             raise TokentrimError(
                 "Compaction is enabled but no compaction model is configured."
             )
 
-        to_compact = messages[: -self._RECENT_MESSAGES_TO_KEEP]
-        recent = messages[-self._RECENT_MESSAGES_TO_KEEP :]
+        to_compact = messages[: -self.keep_last]
+        recent = messages[-self.keep_last :]
         summary = self._compress(to_compact)
         return [{"role": "system", "content": summary}, *recent]
 
@@ -57,7 +76,7 @@ class CompactionStep(ContextStep):
         ]
         try:
             return generate_text(
-                model=self._model,
+                model=self.model,
                 messages=prompt,
                 temperature=0.0,
             )
@@ -65,3 +84,8 @@ class CompactionStep(ContextStep):
             raise
         except Exception as exc:
             raise TokentrimError("Compaction failed.") from exc
+
+
+CompactionStep = CompactConversation
+
+__all__ = ["CompactConversation", "CompactionStep"]

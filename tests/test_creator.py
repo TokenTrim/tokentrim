@@ -12,7 +12,7 @@ def _request(*, task_hint: str | None) -> ToolsRequest:
         tools=tuple(),
         task_hint=task_hint,
         token_budget=None,
-        steps=("creator",),
+        steps=(ToolCreatorStep(),),
     )
 
 

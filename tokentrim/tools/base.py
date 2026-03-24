@@ -18,6 +18,16 @@ class ToolStep(ABC):
         Stable identifier for selecting and tracing this step.
         """
 
+    def resolve(
+        self,
+        *,
+        tokenizer_model: str | None = None,
+        tool_creation_model: str | None = None,
+    ) -> ToolStep:
+        del tokenizer_model
+        del tool_creation_model
+        return self
+
     @abstractmethod
     def run(self, tools: list[Tool], request: ToolsRequest) -> list[Tool]:
         """

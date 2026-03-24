@@ -17,7 +17,7 @@ def _request(*, token_budget: int | None) -> ContextRequest:
         user_id=None,
         session_id=None,
         token_budget=token_budget,
-        steps=("compaction",),
+        steps=(CompactionStep(),),
     )
 
 
@@ -60,6 +60,20 @@ def test_compaction_preserves_recent_messages_and_injects_summary(monkeypatch: p
 
     assert result[0] == {"role": "system", "content": "summary"}
     assert result[1:] == messages[-6:]
+
+
+def test_compaction_respects_custom_keep_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactionStep(model="compact-model", keep_last=8, tokenizer_model=None)
+    messages = _messages(12)
+
+    monkeypatch.setattr(
+        "tokentrim.context.compaction.generate_text",
+        lambda **kwargs: "summary",
+    )
+    result = step.run(messages, _request(token_budget=5))
+
+    assert result[0] == {"role": "system", "content": "summary"}
+    assert result[1:] == messages[-8:]
 
 
 def test_compaction_raises_when_model_is_missing_and_over_budget() -> None:

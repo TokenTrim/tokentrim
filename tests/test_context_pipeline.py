@@ -32,18 +32,17 @@ def test_pipeline_runs_steps_in_order() -> None:
         tokenizer_model=None,
         compaction_model=None,
         memory_store=NoOpMemoryStore(),
-        steps=(
-            RecorderStep("filter", "filter", calls),
-            RecorderStep("compaction", "compaction", calls),
-            RecorderStep("rlm", "rlm", calls),
-        ),
     )
     request = ContextRequest(
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
         token_budget=1000,
-        steps=("filter", "compaction", "rlm"),
+        steps=(
+            RecorderStep("filter", "filter", calls),
+            RecorderStep("compaction", "compaction", calls),
+            RecorderStep("rlm", "rlm", calls),
+        ),
     )
 
     result = pipeline.run(request)
@@ -71,18 +70,13 @@ def test_pipeline_skips_disabled_steps() -> None:
         tokenizer_model=None,
         compaction_model=None,
         memory_store=NoOpMemoryStore(),
-        steps=(
-            RecorderStep("filter", "filter", calls),
-            RecorderStep("compaction", "compaction", calls),
-            RecorderStep("rlm", "rlm", calls),
-        ),
     )
     request = ContextRequest(
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
         token_budget=1000,
-        steps=("filter",),
+        steps=(RecorderStep("filter", "filter", calls),),
     )
 
     pipeline.run(request)
@@ -103,7 +97,7 @@ def test_pipeline_does_not_mutate_input_messages() -> None:
         user_id=None,
         session_id=None,
         token_budget=None,
-        steps=("filter",),
+        steps=(RecorderStep("filter", "filter", []),),
     )
 
     pipeline.run(request)
@@ -163,10 +157,10 @@ def test_pipeline_raises_for_unknown_steps() -> None:
         user_id=None,
         session_id=None,
         token_budget=None,
-        steps=("unknown",),
+        steps=(object(),),
     )
 
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Unknown context steps requested" in str(exc_info.value)
+    assert "Context steps must be ContextStep objects." in str(exc_info.value)

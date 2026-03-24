@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
 
 from tokentrim._copy import clone_messages, freeze_messages
 from tokentrim._tokens import count_message_tokens
 from tokentrim.context.base import ContextStep
-from tokentrim.context.compaction import CompactionStep
-from tokentrim.context.filter import FilterStep
 from tokentrim.context.request import ContextRequest
-from tokentrim.context.rlm import RLMStep
 from tokentrim.context.store import MemoryStore
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
@@ -29,34 +25,28 @@ class ContextPipeline:
         tokenizer_model: str | None,
         compaction_model: str | None,
         memory_store: MemoryStore,
-        steps: Sequence[ContextStep] | None = None,
     ) -> None:
         self._tokenizer_model = tokenizer_model
-        self._steps = tuple(
-            steps
-            or (
-                FilterStep(),
-                CompactionStep(
-                    model=compaction_model,
-                    tokenizer_model=tokenizer_model,
-                ),
-                RLMStep(memory_store=memory_store),
-            )
-        )
+        self._compaction_model = compaction_model
+        self._memory_store = memory_store
 
     def run(self, request: ContextRequest) -> ContextResult:
         messages: list[Message] = clone_messages(request.messages)
-        selected_steps = self._validate_requested_steps(request.steps)
         step_traces: list[StepTrace] = []
 
-        for step in self._steps:
-            if step.name not in selected_steps:
-                continue
+        for step in request.steps:
+            if not isinstance(step, ContextStep):
+                raise TokentrimError("Context steps must be ContextStep objects.")
+            resolved_step = step.resolve(
+                tokenizer_model=self._tokenizer_model,
+                compaction_model=self._compaction_model,
+                memory_store=self._memory_store,
+            )
             before = clone_messages(messages)
-            messages = step.run(messages, request)
+            messages = resolved_step.run(messages, request)
             step_traces.append(
                 StepTrace(
-                    step_name=step.name,
+                    step_name=resolved_step.name,
                     input_count=len(before),
                     output_count=len(messages),
                     changed=messages != before,
@@ -73,13 +63,3 @@ class ContextPipeline:
             token_count=token_count,
             trace_id=str(uuid.uuid4()),
         )
-
-    def _validate_requested_steps(self, step_names: tuple[str, ...]) -> set[str]:
-        known_steps = {step.name for step in self._steps}
-        selected_steps = set(step_names)
-        unknown_steps = sorted(selected_steps - known_steps)
-        if unknown_steps:
-            raise TokentrimError(
-                "Unknown context steps requested: " + ", ".join(unknown_steps)
-            )
-        return selected_steps

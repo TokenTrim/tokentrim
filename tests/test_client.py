@@ -5,12 +5,11 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from tokentrim import Tokentrim
-from tokentrim.context.compaction import CompactionStep
+from tokentrim.context import CompactConversation, FilterMessages, RetrieveMemory
 from tokentrim.context.store import MemoryStore
 from tokentrim.integrations.base import IntegrationAdapter
-from tokentrim.tools.creator import ToolCreatorStep
+from tokentrim.tools import CompressToolDescriptions, CreateTools
 from tokentrim.types.context_result import ContextResult
-from tokentrim.types.step_trace import StepTrace
 from tokentrim.types.tools_result import ToolsResult
 
 
@@ -26,11 +25,6 @@ class EchoAdapter(IntegrationAdapter[str]):
         assert isinstance(tokentrim, Tokentrim)
         return config or "default"
 
-
-def _pipeline_step(steps, name):
-    return next(step for step in steps if step.name == name)
-
-
 def test_constructor_wires_per_feature_models() -> None:
     client = Tokentrim(
         model="shared-model",
@@ -38,13 +32,8 @@ def test_constructor_wires_per_feature_models() -> None:
         tool_creation_model="creator-model",
     )
 
-    compaction = _pipeline_step(client._context_pipeline._steps, "compaction")
-    creator = _pipeline_step(client._tools_pipeline._steps, "creator")
-
-    assert isinstance(compaction, CompactionStep)
-    assert isinstance(creator, ToolCreatorStep)
-    assert compaction._model == "compact-model"
-    assert creator._model == "creator-model"
+    assert client._context_pipeline._compaction_model == "compact-model"
+    assert client._tools_pipeline._tool_creation_model == "creator-model"
     assert client._context_pipeline._tokenizer_model == "shared-model"
 
 
@@ -73,19 +62,14 @@ def test_memory_store_is_propagated_to_context_pipeline() -> None:
     store: MemoryStore = InMemoryStore()
     client = Tokentrim(memory_store=store)
 
-    rlm = _pipeline_step(client._context_pipeline._steps, "rlm")
-
-    assert rlm._memory_store is store
+    assert client._context_pipeline._memory_store is store
 
 
 def test_constructor_uses_shared_model_as_feature_fallback() -> None:
     client = Tokentrim(model="shared-model")
 
-    compaction = _pipeline_step(client._context_pipeline._steps, "compaction")
-    creator = _pipeline_step(client._tools_pipeline._steps, "creator")
-
-    assert compaction._model == "shared-model"
-    assert creator._model == "shared-model"
+    assert client._context_pipeline._compaction_model == "shared-model"
+    assert client._tools_pipeline._tool_creation_model == "shared-model"
 
 
 def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -161,7 +145,11 @@ def test_get_better_context_wires_filter_compaction_and_rlm(
         user_id="u1",
         session_id="s1",
         token_budget=30,
-        steps=("filter", "compaction", "rlm"),
+        steps=(
+            FilterMessages(),
+            CompactConversation(),
+            RetrieveMemory(),
+        ),
     )
 
     assert isinstance(result.messages, tuple)
@@ -202,7 +190,10 @@ def test_get_better_tools_wires_bpe_and_creator(
     result = client.get_better_tools(
         tools,
         task_hint="investigate",
-        steps=("bpe", "creator"),
+        steps=(
+            CompressToolDescriptions(),
+            CreateTools(),
+        ),
     )
 
     assert isinstance(result.tools, tuple)

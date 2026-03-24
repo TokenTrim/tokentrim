@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 
 from tokentrim.tools.base import ToolStep
 from tokentrim.tools.request import ToolsRequest
 from tokentrim.types.tool import Tool
 
 
-class ToolBPEStep(ToolStep):
+@dataclass(frozen=True, slots=True)
+class CompressToolDescriptions(ToolStep):
     """
     Deterministically normalise and shorten tool descriptions.
     """
 
-    _MAX_DESCRIPTION_CHARS = 200
+    max_description_chars: int = 200
 
     @property
     def name(self) -> str:
@@ -23,11 +25,16 @@ class ToolBPEStep(ToolStep):
 
     def _compress(self, tool: Tool) -> Tool:
         normalized = " ".join(tool["description"].split())
-        if len(normalized) > self._MAX_DESCRIPTION_CHARS:
-            normalized = normalized[: self._MAX_DESCRIPTION_CHARS - 3].rstrip() + "..."
+        if len(normalized) > self.max_description_chars:
+            normalized = normalized[: self.max_description_chars - 3].rstrip() + "..."
 
         return {
             "name": tool["name"],
             "description": normalized,
             "input_schema": deepcopy(tool["input_schema"]),
         }
+
+
+ToolBPEStep = CompressToolDescriptions
+
+__all__ = ["CompressToolDescriptions", "ToolBPEStep"]
