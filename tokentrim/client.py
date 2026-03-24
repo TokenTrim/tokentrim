@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, TypeVar
 
 from tokentrim._copy import freeze_messages, freeze_tools
 from tokentrim.context.pipeline import ContextPipeline
@@ -12,6 +12,12 @@ from tokentrim.types.context_result import ContextResult
 from tokentrim.types.message import Message
 from tokentrim.types.tool import Tool
 from tokentrim.types.tools_result import ToolsResult
+
+if TYPE_CHECKING:
+    from tokentrim.integrations.base import IntegrationAdapter
+
+
+AdapterConfigT = TypeVar("AdapterConfigT")
 
 
 class Tokentrim:
@@ -83,12 +89,10 @@ class Tokentrim:
         )
         return self._tools_pipeline.run(request)
 
-    def wrap_openai_agents_run_config(
+    def wrap_integration(
         self,
-        run_config: Any | None = None,
+        adapter: IntegrationAdapter[AdapterConfigT],
         *,
-        options: Any | None = None,
-    ) -> Any:
-        from tokentrim.integrations.openai_agents import wrap_run_config
-
-        return wrap_run_config(self, run_config=run_config, options=options)
+        config: AdapterConfigT | None = None,
+    ) -> AdapterConfigT:
+        return adapter.wrap(self, config=config)

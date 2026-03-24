@@ -59,7 +59,7 @@ tools_result = tt.get_better_tools(
 from agents import Agent, Runner
 
 from tokentrim import Tokentrim
-from tokentrim.integrations import OpenAIAgentsOptions, wrap_run_config
+from tokentrim.integrations import OpenAIAgentsAdapter, OpenAIAgentsOptions
 
 tt = Tokentrim(
     model="gpt-4o-mini",
@@ -71,15 +71,16 @@ agent = Agent(
     instructions="Answer concisely.",
 )
 
-run_config = wrap_run_config(
-    tt,
-    options=OpenAIAgentsOptions(
-        token_budget=8000,
-        enable_filter=True,
-        enable_compaction=True,
-        enable_rlm=True,
-        user_id="user-123",
-        session_id="session-456",
+run_config = tt.wrap_integration(
+    OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(
+            token_budget=8000,
+            enable_filter=True,
+            enable_compaction=True,
+            enable_rlm=True,
+            user_id="user-123",
+            session_id="session-456",
+        )
     ),
 )
 

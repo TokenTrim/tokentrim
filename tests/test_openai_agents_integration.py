@@ -11,7 +11,11 @@ from agents.handoffs import HandoffInputData
 from agents.run import CallModelData, ModelInputData
 
 from tokentrim import Tokentrim
-from tokentrim.integrations.openai_agents import OpenAIAgentsOptions, wrap_run_config
+from tokentrim.integrations.base import IntegrationAdapter
+from tokentrim.integrations.openai_agents import (
+    OpenAIAgentsAdapter,
+    OpenAIAgentsOptions,
+)
 
 
 class InMemoryStore:
@@ -25,17 +29,16 @@ def _message_items(count: int) -> list[dict[str, str]]:
     return [{"role": "user", "content": f"message {index} " + ("x" * 40)} for index in range(count)]
 
 
-def test_wrap_run_config_compacts_plain_text_inputs(
+def test_openai_agents_adapter_compacts_plain_text_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = Tokentrim(compaction_model="compact-model")
-    wrapped = wrap_run_config(
-        client,
+    wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=25,
             enable_compaction=True,
-        ),
-    )
+        )
+    ).wrap(client)
     input_items = [
         {"role": "user", "content": "old 0 " + ("x" * 80)},
         {"role": "assistant", "content": "old 1 " + ("x" * 80)},
@@ -68,11 +71,23 @@ def test_wrap_run_config_compacts_plain_text_inputs(
     assert result.input[1:] == input_items[-6:]
 
 
-def test_wrap_run_config_chains_existing_model_filter() -> None:
+def test_openai_agents_adapter_implements_integration_adapter() -> None:
     client = Tokentrim()
-    wrapped = wrap_run_config(
+    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(enable_filter=True))
+
+    wrapped = adapter.wrap(client)
+
+    assert isinstance(adapter, IntegrationAdapter)
+    assert isinstance(wrapped, RunConfig)
+
+
+def test_openai_agents_adapter_chains_existing_model_filter() -> None:
+    client = Tokentrim()
+    wrapped = OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(enable_filter=True)
+    ).wrap(
         client,
-        run_config=RunConfig(
+        config=RunConfig(
             call_model_input_filter=lambda data: ModelInputData(
                 input=[
                     {"role": "user", "content": "hello"},
@@ -81,7 +96,6 @@ def test_wrap_run_config_chains_existing_model_filter() -> None:
                 instructions="custom instructions",
             )
         ),
-        options=OpenAIAgentsOptions(enable_filter=True),
     )
     payload = CallModelData(
         model_data=ModelInputData(
@@ -98,16 +112,17 @@ def test_wrap_run_config_chains_existing_model_filter() -> None:
     assert result.input == [{"role": "user", "content": "hello [repeated 2x]"}]
 
 
-def test_wrap_run_config_chains_existing_session_callback() -> None:
+def test_openai_agents_adapter_chains_existing_session_callback() -> None:
     client = Tokentrim()
 
     def session_callback(history_items, new_items):
         return [*history_items, {"role": "assistant", "content": "   "}, *new_items]
 
-    wrapped = wrap_run_config(
+    wrapped = OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(enable_filter=True)
+    ).wrap(
         client,
-        run_config=RunConfig(session_input_callback=session_callback),
-        options=OpenAIAgentsOptions(enable_filter=True),
+        config=RunConfig(session_input_callback=session_callback),
     )
 
     result = asyncio.run(
@@ -123,16 +138,15 @@ def test_wrap_run_config_chains_existing_session_callback() -> None:
     ]
 
 
-def test_wrap_run_config_applies_rlm_to_handoff_history() -> None:
+def test_openai_agents_adapter_applies_rlm_to_handoff_history() -> None:
     client = Tokentrim(memory_store=InMemoryStore())
-    wrapped = wrap_run_config(
-        client,
+    wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             user_id="u1",
             session_id="s1",
             enable_rlm=True,
-        ),
-    )
+        )
+    ).wrap(client)
     payload = HandoffInputData(
         input_history="hello",
         pre_handoff_items=(),
@@ -149,16 +163,15 @@ def test_wrap_run_config_applies_rlm_to_handoff_history() -> None:
     assert result.new_items == ()
 
 
-def test_wrap_run_config_preserves_rich_response_items() -> None:
+def test_openai_agents_adapter_preserves_rich_response_items() -> None:
     client = Tokentrim()
-    wrapped = wrap_run_config(
-        client,
+    wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=1,
             enable_filter=True,
             enable_compaction=True,
-        ),
-    )
+        )
+    ).wrap(client)
     input_items = [
         {"role": "user", "content": "hello"},
         {
@@ -182,11 +195,11 @@ def test_wrap_run_config_preserves_rich_response_items() -> None:
     assert result.input == input_items
 
 
-def test_client_wrap_openai_agents_run_config_delegates() -> None:
+def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
     client = Tokentrim()
 
-    wrapped = client.wrap_openai_agents_run_config(
-        options=OpenAIAgentsOptions(enable_filter=True)
+    wrapped = client.wrap_integration(
+        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(enable_filter=True))
     )
 
     assert isinstance(wrapped, RunConfig)

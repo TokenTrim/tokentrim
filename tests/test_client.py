@@ -6,6 +6,7 @@ import pytest
 
 from tokentrim import Tokentrim
 from tokentrim.context.store import MemoryStore
+from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.types.context_result import ContextResult
 from tokentrim.types.tools_result import ToolsResult
 
@@ -15,6 +16,12 @@ class InMemoryStore:
         if user_id == "u1" and session_id == "s1":
             return "stored context"
         return None
+
+
+class EchoAdapter(IntegrationAdapter[str]):
+    def wrap(self, tokentrim: Tokentrim, config: str | None = None) -> str:
+        assert isinstance(tokentrim, Tokentrim)
+        return config or "default"
 
 
 def test_constructor_wires_per_feature_models() -> None:
@@ -78,6 +85,14 @@ def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch
 
     assert captured["token_budget"] == 9
     assert result.trace_id == "trace"
+
+
+def test_wrap_integration_delegates_to_adapter() -> None:
+    client = Tokentrim()
+
+    result = client.wrap_integration(EchoAdapter(), config="wrapped")
+
+    assert result == "wrapped"
 
 
 def test_public_methods_return_frozen_result_objects() -> None:

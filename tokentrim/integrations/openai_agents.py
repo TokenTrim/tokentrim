@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from tokentrim.errors.base import TokentrimError
+from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.types.message import Message
 
 if TYPE_CHECKING:
@@ -36,48 +37,46 @@ class OpenAIAgentsOptions:
     apply_to_handoffs: bool = True
 
 
-def wrap_run_config(
-    tokentrim: Tokentrim,
-    *,
-    run_config: RunConfig | None = None,
-    options: OpenAIAgentsOptions | None = None,
-) -> RunConfig:
+class OpenAIAgentsAdapter(IntegrationAdapter["RunConfig"]):
     """
-    Wrap an Agents SDK RunConfig so Tokentrim trims plain-text message inputs.
+    Tokentrim adapter for the OpenAI Agents SDK.
     """
 
-    RunConfig, _, _ = _load_agents_sdk()
-    resolved_options = options or OpenAIAgentsOptions()
-    effective_run_config = run_config or RunConfig()
-    if not _requires_adapter(resolved_options):
-        return effective_run_config
+    def __init__(self, options: OpenAIAgentsOptions | None = None) -> None:
+        self._options = options or OpenAIAgentsOptions()
 
-    return replace(
-        effective_run_config,
-        call_model_input_filter=_build_call_model_input_filter(
-            tokentrim,
-            existing_filter=effective_run_config.call_model_input_filter,
-            options=resolved_options,
-        ),
-        session_input_callback=(
-            _build_session_input_callback(
+    def wrap(self, tokentrim: Tokentrim, config: RunConfig | None = None) -> RunConfig:
+        RunConfig, _, _ = _load_agents_sdk()
+        effective_run_config = config or RunConfig()
+        if not _requires_adapter(self._options):
+            return effective_run_config
+
+        return replace(
+            effective_run_config,
+            call_model_input_filter=_build_call_model_input_filter(
                 tokentrim,
-                existing_callback=effective_run_config.session_input_callback,
-                options=resolved_options,
-            )
-            if resolved_options.apply_to_session_history
-            else effective_run_config.session_input_callback
-        ),
-        handoff_input_filter=(
-            _build_handoff_input_filter(
-                tokentrim,
-                existing_filter=effective_run_config.handoff_input_filter,
-                options=resolved_options,
-            )
-            if resolved_options.apply_to_handoffs
-            else effective_run_config.handoff_input_filter
-        ),
-    )
+                existing_filter=effective_run_config.call_model_input_filter,
+                options=self._options,
+            ),
+            session_input_callback=(
+                _build_session_input_callback(
+                    tokentrim,
+                    existing_callback=effective_run_config.session_input_callback,
+                    options=self._options,
+                )
+                if self._options.apply_to_session_history
+                else effective_run_config.session_input_callback
+            ),
+            handoff_input_filter=(
+                _build_handoff_input_filter(
+                    tokentrim,
+                    existing_filter=effective_run_config.handoff_input_filter,
+                    options=self._options,
+                )
+                if self._options.apply_to_handoffs
+                else effective_run_config.handoff_input_filter
+            ),
+        )
 
 
 def _requires_adapter(options: OpenAIAgentsOptions) -> bool:
@@ -301,6 +300,6 @@ def _message_to_input_item(message: Message) -> TResponseInputItem:
 
 
 __all__ = [
+    "OpenAIAgentsAdapter",
     "OpenAIAgentsOptions",
-    "wrap_run_config",
 ]
