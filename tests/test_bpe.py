@@ -1,6 +1,17 @@
 from __future__ import annotations
 
 from tokentrim.tools.bpe import ToolBPEStep
+from tokentrim.tools.request import ToolsRequest
+
+
+def _request() -> ToolsRequest:
+    return ToolsRequest(
+        tools=tuple(),
+        task_hint=None,
+        token_budget=None,
+        enable_tool_bpe=True,
+        enable_tool_creation=False,
+    )
 
 
 def test_bpe_normalizes_whitespace_and_preserves_schema() -> None:
@@ -11,7 +22,7 @@ def test_bpe_normalizes_whitespace_and_preserves_schema() -> None:
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool])[0]
+    result = step.run([tool], _request())[0]
 
     assert result["name"] == "search"
     assert result["description"] == "search the knowledge base"
@@ -26,7 +37,7 @@ def test_bpe_returns_new_objects_and_deep_copies_schema() -> None:
         "input_schema": {"properties": {"query": {"type": "string"}}},
     }
 
-    result = step.run([tool])[0]
+    result = step.run([tool], _request())[0]
     result["input_schema"]["properties"]["query"]["type"] = "number"
 
     assert result is not tool
@@ -41,7 +52,7 @@ def test_bpe_trims_long_descriptions() -> None:
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool])[0]
+    result = step.run([tool], _request())[0]
 
     assert len(result["description"]) == 200
     assert result["description"].endswith("...")
@@ -55,6 +66,6 @@ def test_bpe_leaves_short_description_text_unchanged_after_normalization() -> No
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool])[0]
+    result = step.run([tool], _request())[0]
 
     assert result["description"] == "already short"

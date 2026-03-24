@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tokentrim.context.request import ContextRequest
 from tokentrim.context.rlm import RLMStep
 from tokentrim.context.store import NoOpMemoryStore
 
@@ -14,11 +15,23 @@ class FakeStore:
         return self._value
 
 
+def _request(*, user_id: str | None, session_id: str | None) -> ContextRequest:
+    return ContextRequest(
+        messages=tuple(),
+        user_id=user_id,
+        session_id=session_id,
+        token_budget=None,
+        enable_compaction=False,
+        enable_rlm=True,
+        enable_filter=False,
+    )
+
+
 def test_rlm_is_noop_without_identifiers() -> None:
     step = RLMStep(memory_store=NoOpMemoryStore())
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, user_id=None, session_id="session")
+    result = step.run(messages, _request(user_id=None, session_id="session"))
 
     assert result == messages
 
@@ -27,7 +40,7 @@ def test_rlm_is_noop_without_retrieved_state() -> None:
     step = RLMStep(memory_store=FakeStore(None))
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, user_id="user", session_id="session")
+    result = step.run(messages, _request(user_id="user", session_id="session"))
 
     assert result == messages
 
@@ -36,7 +49,7 @@ def test_rlm_prepends_retrieved_state() -> None:
     step = RLMStep(memory_store=FakeStore("remember this"))
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, user_id="user", session_id="session")
+    result = step.run(messages, _request(user_id="user", session_id="session"))
 
     assert result == [
         {"role": "system", "content": "remember this"},
@@ -48,6 +61,9 @@ def test_rlm_calls_store_with_exact_identifiers() -> None:
     store = FakeStore("remember this")
     step = RLMStep(memory_store=store)
 
-    step.run([{"role": "user", "content": "hello"}], user_id="user-1", session_id="session-1")
+    step.run(
+        [{"role": "user", "content": "hello"}],
+        _request(user_id="user-1", session_id="session-1"),
+    )
 
     assert store.calls == [("user-1", "session-1")]

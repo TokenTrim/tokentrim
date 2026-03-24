@@ -28,28 +28,23 @@ class ContextPipeline:
     ) -> None:
         self._tokenizer_model = tokenizer_model
         self._filter = FilterStep()
-        self._compaction = CompactionStep(model=compaction_model)
+        self._compaction = CompactionStep(
+            model=compaction_model,
+            tokenizer_model=tokenizer_model,
+        )
         self._rlm = RLMStep(memory_store=memory_store)
 
     def run(self, request: ContextRequest) -> ContextResult:
         messages: list[Message] = clone_messages(request.messages)
 
         if request.enable_filter:
-            messages = self._filter.run(messages)
+            messages = self._filter.run(messages, request)
 
         if request.enable_compaction:
-            messages = self._compaction.run(
-                messages,
-                token_budget=request.token_budget,
-                tokenizer_model=self._tokenizer_model,
-            )
+            messages = self._compaction.run(messages, request)
 
         if request.enable_rlm:
-            messages = self._rlm.run(
-                messages,
-                user_id=request.user_id,
-                session_id=request.session_id,
-            )
+            messages = self._rlm.run(messages, request)
 
         token_count = count_message_tokens(messages, self._tokenizer_model)
         if request.token_budget is not None and token_count > request.token_budget:
@@ -60,4 +55,3 @@ class ContextPipeline:
             token_count=token_count,
             trace_id=str(uuid.uuid4()),
         )
-

@@ -3,17 +3,19 @@ from __future__ import annotations
 import pytest
 
 from tokentrim.errors.budget import BudgetExceededError
+from tokentrim.tools.base import ToolStep
 from tokentrim.tools.pipeline import ToolsPipeline
 from tokentrim.tools.request import ToolsRequest
 
 
-class RecorderStep:
+class RecorderStep(ToolStep):
     def __init__(self, name: str, description: str, calls: list[str]) -> None:
         self._name = name
         self._description = description
         self._calls = calls
 
-    def run(self, tools, **kwargs):
+    def run(self, tools, request):
+        del request
         self._calls.append(self._name)
         return [
             *tools,
@@ -25,11 +27,13 @@ class RecorderStep:
         ]
 
 
-class CreatorRecorder:
+class CreatorRecorder(ToolStep):
     def __init__(self, calls: list[str]) -> None:
         self._calls = calls
 
-    def run(self, tools, **kwargs):
+    def run(self, tools, request):
+        del tools
+        del request
         self._calls.append("creator")
         return [
             {

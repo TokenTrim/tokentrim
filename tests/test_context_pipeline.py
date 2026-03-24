@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import pytest
 
+from tokentrim.context.base import ContextStep
 from tokentrim.context.pipeline import ContextPipeline
 from tokentrim.context.request import ContextRequest
 from tokentrim.context.store import NoOpMemoryStore
 from tokentrim.errors.budget import BudgetExceededError
 
 
-class RecorderStep:
+class RecorderStep(ContextStep):
     def __init__(self, name: str, marker: str, calls: list[str]) -> None:
         self._name = name
         self._marker = marker
         self._calls = calls
 
-    def run(self, messages, **kwargs):
+    def run(self, messages, request):
+        del request
         self._calls.append(self._name)
         return [*messages, {"role": "system", "content": self._marker}]
 

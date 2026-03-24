@@ -32,10 +32,10 @@ class ToolsPipeline:
         created_tools: list[Tool] = []
 
         if request.enable_tool_bpe:
-            tools = self._bpe.run(tools)
+            tools = self._bpe.run(tools, request)
 
         if request.enable_tool_creation:
-            created_tools = self._creator.run(tools, task_hint=request.task_hint)
+            created_tools = self._creator.run(tools, request)
             tools = [*tools, *created_tools]
 
         token_count = count_tool_tokens(tools, self._tokenizer_model)
@@ -48,4 +48,3 @@ class ToolsPipeline:
             token_count=token_count,
             trace_id=str(uuid.uuid4()),
         )
-

@@ -4,6 +4,17 @@ import pytest
 
 from tokentrim.errors.base import TokentrimError
 from tokentrim.tools.creator import ToolCreatorStep
+from tokentrim.tools.request import ToolsRequest
+
+
+def _request(*, task_hint: str | None) -> ToolsRequest:
+    return ToolsRequest(
+        tools=tuple(),
+        task_hint=task_hint,
+        token_budget=None,
+        enable_tool_bpe=False,
+        enable_tool_creation=True,
+    )
 
 
 def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -26,7 +37,7 @@ def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
 
-    result = step.run(tools, task_hint="investigate")
+    result = step.run(tools, _request(task_hint="investigate"))
 
     assert result == [
         {
@@ -40,7 +51,7 @@ def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_creator_is_noop_when_no_tools_and_no_task_hint() -> None:
     step = ToolCreatorStep(model="creator-model")
 
-    result = step.run([], task_hint=None)
+    result = step.run([], _request(task_hint=None))
 
     assert result == []
 
@@ -49,7 +60,7 @@ def test_creator_raises_when_model_is_missing() -> None:
     step = ToolCreatorStep(model=None)
 
     with pytest.raises(TokentrimError) as exc_info:
-        step.run([], task_hint="investigate")
+        step.run([], _request(task_hint="investigate"))
 
     assert "no tool creation model" in str(exc_info.value)
 
@@ -63,7 +74,7 @@ def test_creator_raises_for_invalid_json(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], task_hint="investigate")
+        step.run([], _request(task_hint="investigate"))
 
 
 def test_creator_raises_for_invalid_top_level_payload(
@@ -77,7 +88,7 @@ def test_creator_raises_for_invalid_top_level_payload(
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], task_hint="investigate")
+        step.run([], _request(task_hint="investigate"))
 
 
 def test_creator_raises_for_invalid_tool_entries(
@@ -91,7 +102,7 @@ def test_creator_raises_for_invalid_tool_entries(
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], task_hint="investigate")
+        step.run([], _request(task_hint="investigate"))
 
 
 def test_creator_deduplicates_repeated_generated_names(
@@ -109,7 +120,7 @@ def test_creator_deduplicates_repeated_generated_names(
         ),
     )
 
-    result = step.run([], task_hint="investigate")
+    result = step.run([], _request(task_hint="investigate"))
 
     assert result == [
         {

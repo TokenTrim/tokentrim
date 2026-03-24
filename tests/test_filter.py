@@ -1,6 +1,19 @@
 from __future__ import annotations
 
+from tokentrim.context.request import ContextRequest
 from tokentrim.context.filter import FilterStep
+
+
+def _request() -> ContextRequest:
+    return ContextRequest(
+        messages=tuple(),
+        user_id=None,
+        session_id=None,
+        token_budget=None,
+        enable_compaction=False,
+        enable_rlm=False,
+        enable_filter=True,
+    )
 
 
 def test_filter_removes_empty_messages() -> None:
@@ -11,7 +24,7 @@ def test_filter_removes_empty_messages() -> None:
         {"role": "assistant", "content": ""},
     ]
 
-    result = step.run(messages)
+    result = step.run(messages, _request())
 
     assert result == [{"role": "user", "content": "hello"}]
 
@@ -24,7 +37,7 @@ def test_filter_collapses_consecutive_duplicates() -> None:
         {"role": "user", "content": "click"},
     ]
 
-    result = step.run(messages)
+    result = step.run(messages, _request())
 
     assert result == [{"role": "user", "content": "click [repeated 3x]"}]
 
@@ -37,7 +50,6 @@ def test_filter_preserves_non_consecutive_duplicates() -> None:
         {"role": "user", "content": "click"},
     ]
 
-    result = step.run(messages)
+    result = step.run(messages, _request())
 
     assert result == messages
-

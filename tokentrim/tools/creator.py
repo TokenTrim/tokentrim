@@ -4,10 +4,12 @@ import json
 
 from tokentrim._llm import generate_text
 from tokentrim.errors.base import TokentrimError
+from tokentrim.tools.base import ToolStep
+from tokentrim.tools.request import ToolsRequest
 from tokentrim.types.tool import Tool
 
 
-class ToolCreatorStep:
+class ToolCreatorStep(ToolStep):
     """
     Ask a model to propose missing tools and return only valid additions.
     """
@@ -15,8 +17,8 @@ class ToolCreatorStep:
     def __init__(self, model: str | None) -> None:
         self._model = model
 
-    def run(self, tools: list[Tool], *, task_hint: str | None) -> list[Tool]:
-        if not tools and not task_hint:
+    def run(self, tools: list[Tool], request: ToolsRequest) -> list[Tool]:
+        if not tools and not request.task_hint:
             return []
         if not self._model:
             raise TokentrimError(
@@ -24,7 +26,7 @@ class ToolCreatorStep:
             )
 
         existing_names = {tool["name"] for tool in tools}
-        raw_output = self._generate(tools, task_hint=task_hint)
+        raw_output = self._generate(tools, task_hint=request.task_hint)
 
         try:
             payload = json.loads(raw_output)
@@ -95,4 +97,3 @@ class ToolCreatorStep:
             "description": description,
             "input_schema": input_schema,
         }
-
