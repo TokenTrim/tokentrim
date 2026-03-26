@@ -21,6 +21,13 @@ The same runtime supports both payload kinds:
 pip install tokentrim
 ```
 
+For development:
+
+```bash
+pip install -e ".[dev,openai-agents]"
+pre-commit install
+```
+
 ## Usage
 
 ### Context Only

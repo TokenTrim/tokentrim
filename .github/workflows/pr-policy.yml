@@ -1,0 +1,54 @@
+name: PR Policy
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+
+jobs:
+  title-and-merge-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title format
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_TITLE" =~ ^(fix|patch|docs|feat|feat!|bump):[[:space:]].+ ]]; then
+            echo "Invalid PR title: '$PR_TITLE'"
+            echo "Expected one of: fix:, patch:, docs:, feat:, feat!:, bump:"
+            exit 1
+          fi
+
+      - name: Enforce squash-only repository merge settings
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const errors = [];
+            if (!repo.allow_squash_merge) {
+              errors.push("allow_squash_merge must be enabled.");
+            }
+            if (repo.allow_merge_commit) {
+              errors.push("allow_merge_commit must be disabled.");
+            }
+            if (repo.allow_rebase_merge) {
+              errors.push("allow_rebase_merge must be disabled.");
+            }
+
+            if (errors.length) {
+              core.setFailed(`Squash-only policy not satisfied: ${errors.join(" ")}`);
+            }

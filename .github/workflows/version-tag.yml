@@ -1,0 +1,81 @@
+name: Version Tag
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  bump-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate and create semantic tag from commit title
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          subject="$(git log -1 --pretty=%s)"
+          echo "Head commit title: $subject"
+
+          if [[ ! "$subject" =~ ^(fix|patch|docs|feat|feat!|bump):[[:space:]].+ ]]; then
+            echo "Commit title does not match required format."
+            echo "Expected one of: fix:, patch:, docs:, feat:, feat!:, bump:"
+            exit 1
+          fi
+
+          prefix="${subject%%:*}"
+
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          if [[ -z "$latest_tag" ]]; then
+            latest_tag="v0.0.0"
+          fi
+
+          if [[ ! "$latest_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Latest tag '$latest_tag' is not in vX.Y.Z format"
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          case "$prefix" in
+            fix|patch|docs|bump)
+              patch=$((patch + 1))
+              ;;
+            feat)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            feat!)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            *)
+              echo "Unsupported prefix '$prefix'"
+              exit 1
+              ;;
+          esac
+
+          new_tag="v${major}.${minor}.${patch}"
+          echo "New tag: $new_tag"
+
+          if git rev-parse -q --verify "refs/tags/$new_tag" >/dev/null; then
+            echo "Tag $new_tag already exists. Nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$new_tag"
+          git push origin "$new_tag"
