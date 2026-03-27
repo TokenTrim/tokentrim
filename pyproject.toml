@@ -21,7 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "mypy",
+    "pre-commit",
     "pytest>=8.0",
+    "pytest-cov>=5.0",
     "ruff",
 ]
 openai-agents = [
@@ -31,3 +33,7 @@ openai-agents = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/tokentrim"]
+addopts = "--cov=tokentrim --cov-report=term-missing --cov-report=term --cov-fail-under=80"

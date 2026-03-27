@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from tokentrim.types.step_trace import StepTrace
+
 
 @dataclass(frozen=True, slots=True)
-class StepTrace:
-    step_name: str
-    input_items: int
-    output_items: int
+class Trace:
+    id: str
+    token_budget: int | None
     input_tokens: int
     output_tokens: int
-    changed: bool
+    steps: tuple[StepTrace, ...]
