@@ -75,6 +75,29 @@ def test_generate_text_supports_object_style_response(
     assert result == "world"
 
 
+def test_generate_text_omits_temperature_for_gpt5_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def completion(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+
+    result = generate_text(
+        model="gpt-5",
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0.0,
+    )
+
+    assert result == "ok"
+    assert captured["model"] == "gpt-5"
+    assert captured["messages"] == [{"role": "user", "content": "hello"}]
+    assert "temperature" not in captured
+
+
 def test_generate_text_raises_when_response_has_no_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -90,4 +113,3 @@ def test_generate_text_raises_when_response_has_no_content(
         generate_text(model="test-model", messages=[])
 
     assert "did not contain text content" in str(exc_info.value)
-

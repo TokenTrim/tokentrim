@@ -21,12 +21,16 @@ def generate_text(
         ) from exc
 
     try:
-        response = completion(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            response_format=response_format,
-        )
+        completion_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+        }
+        if response_format is not None:
+            completion_kwargs["response_format"] = response_format
+        if not _should_omit_temperature(model=model, temperature=temperature):
+            completion_kwargs["temperature"] = temperature
+
+        response = completion(**completion_kwargs)
     except Exception as exc:
         raise TokentrimError(
             f"LiteLLM completion failed for model '{model}'."
@@ -36,6 +40,14 @@ def generate_text(
         return _extract_content(response).strip()
     except Exception as exc:
         raise TokentrimError("LiteLLM response did not contain text content.") from exc
+
+
+def _should_omit_temperature(*, model: str, temperature: float) -> bool:
+    normalized_model = model.strip().lower()
+    if temperature != 0.0:
+        return False
+
+    return normalized_model == "gpt-5" or normalized_model.startswith("gpt-5-")
 
 
 def _extract_content(response: Any) -> str:
@@ -59,4 +71,3 @@ def _extract_content(response: Any) -> str:
         if parts:
             return "".join(parts)
     raise ValueError("No message content found.")
-
