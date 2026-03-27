@@ -24,11 +24,11 @@ Execution shape:
 
 1. create client with shared defaults (tokenizer, default token budget)
 2. compose transform instances
-3. call `.apply(payload, ...)`
+3. call `.apply(...)`
 4. receive one immutable `Result`
 
-There are no separate context/tools runner types. Both payload kinds use the
-same compose-first execution path.
+There are no separate context/tools runner types. Both payload tracks use the
+same compose-first execution path and the same internal pipeline state.
 
 For OpenAI Agents users, the primary integration path is:
 
@@ -48,7 +48,7 @@ Additional public helpers exist on `Tokentrim`:
 | Path | Responsibility |
 | --- | --- |
 | `tokentrim/client.py` | Public facade and compose-first API |
-| `tokentrim/pipeline/requests.py` | Immutable request models (`ContextRequest`, `ToolsRequest`) |
+| `tokentrim/pipeline/requests.py` | Immutable request models (`PipelineRequest` plus compatibility wrappers) |
 | `tokentrim/pipeline/pipeline.py` | Unified execution runtime (`UnifiedPipeline`) |
 | `tokentrim/transforms/base.py` | Shared transform contract |
 | `tokentrim/transforms/filter/` | Message filtering transform |
@@ -59,7 +59,7 @@ Additional public helpers exist on `Tokentrim`:
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
 | `tokentrim/core/token_counting.py` | Token counting helpers |
 | `tokentrim/core/llm_client.py` | LiteLLM wrapper used by model-backed transforms |
-| `tokentrim/types/` | Shared datatypes (`Message`, `Tool`, `Trace`, `StepTrace`, `Result`) |
+| `tokentrim/types/` | Shared datatypes (`Message`, `Tool`, `PipelineState`, `Trace`, `StepTrace`, `Result`) |
 | `tokentrim/integrations/base.py` | Integration adapter contract |
 | `tokentrim/integrations/openai_agents/` | OpenAI Agents adapter modules |
 | `tokentrim/errors/` | Shared error taxonomy |
@@ -70,50 +70,47 @@ Tokentrim uses minimal payload types:
 
 - `Message`: `{role, content}`
 - `Tool`: `{name, description, input_schema}`
+- `PipelineState`: `{context: list[Message], tools: list[Tool]}`
 
 Every run returns one `Result`:
 
 - `trace: Trace`
-- `context: tuple[Message, ...] | None`
-- `tools: tuple[Tool, ...] | None`
+- `context: tuple[Message, ...]`
+- `tools: tuple[Tool, ...]`
 
-Exactly one of `context` or `tools` is populated per run.
+Both result payload fields are always present. Unused sides are empty tuples.
 
 ## Transform Contract
 
 All transforms implement `Transform` (`tokentrim/transforms/base.py`):
 
 - `name`: stable identifier for tracing
-- `kind`: payload track (`"context"` or `"tools"`)
 - optional `resolve(tokenizer_model=...)`: binding phase before run
-- `run(payload, request)`: transform step for one payload kind
-
-`kind` is used internally to prevent invalid composition and wiring mistakes
-(for example mixing context and tools steps).
+- `run(state, request)`: transform step over one shared `PipelineState`
 
 Transform expectations:
 
-- context transforms operate on `list[Message]` and receive `ContextRequest`
-- tools transforms operate on `list[Tool]` and receive `ToolsRequest`
-- transforms should return a new logical payload and must not rely on mutating
+- every transform receives both `context` and `tools` via `PipelineState`
+- transforms may read or modify either side of state
+- transforms should return a new logical state and must not rely on mutating
   caller-owned input state
 - `resolve(...)` is the place to bind tokenizer-dependent or model-dependent
   configuration before execution
 
 ## Pipeline Runtime
 
-`UnifiedPipeline.run(request)` handles both request types with shared internal
-execution (`_run_payload`):
+`UnifiedPipeline.run(request)` executes one shared state flow:
 
-1. clone inbound payload
+1. clone inbound request payloads into `PipelineState`
 2. resolve each step
 3. execute step in order
-4. compute per-step token/item deltas
+4. compute per-step token/item deltas from state before/after each step
 5. enforce final token budget
-6. freeze result payload
+6. freeze final context/tools payloads
 7. return immutable `Result`
 
-Budget enforcement is centralized at pipeline exit.
+Budget enforcement is centralized at pipeline exit and currently uses combined
+context + tools token counts.
 
 Tracing is also centralized in the pipeline. Each executed step produces one
 `StepTrace` entry with item counts, token counts, and a changed/not-changed
@@ -136,6 +133,10 @@ OpenAI Agents integration is split by concern:
 - `mappers.py`: payload mapping logic
 - `hooks.py`: integration hook wiring
 - `adapter.py`: orchestrating adapter entrypoint
+
+The current OpenAI Agents integration is still driven by message-oriented hook
+payloads. The adapter maps those into Tokentrim message inputs and ignores the
+tools side unless the caller explicitly supplies tools through another path.
 
 ## Error Model
 
@@ -166,10 +167,10 @@ Coverage is enforced in CI via pytest coverage thresholds.
 4. add `error.py` only if the transform needs transform-specific exceptions
 5. implement `Transform` with:
    - stable `name` for tracing
-   - correct `kind` (`"context"` or `"tools"`)
-   - a `run(...)` signature that matches that kind's request type
+   - a `run(state, request)` implementation that accepts and returns
+     `PipelineState`
    - optional `resolve(...)` if configuration must be bound at runtime
-6. keep the transform focused on payload transformation; cloning, freezing,
+6. keep the transform focused on state transformation; cloning, freezing,
    token accounting, tracing, and budget enforcement are handled by the
    pipeline
 7. export from `tokentrim/transforms/__init__.py` if the transform is public
@@ -182,8 +183,8 @@ Conventions used in this repository:
 - transform packages are small and self-contained
 - public transform names are exported from both the package-local `__init__.py`
   and `tokentrim/transforms/__init__.py`
-- transform tests should cover happy path behavior and any transform-local
-  failure modes
+- transform tests should cover happy path behavior, unchanged-side behavior,
+  and any transform-local failure modes
 
 ## Add a New Integration
 
@@ -209,3 +210,7 @@ For local test runs, install the package in editable mode or set
 
 - `pip install -e ".[dev,openai-agents]"`
 - `PYTHONPATH=.` when running `pytest -q`
+
+For empty payload runs, prefer explicit `context=[]` or `tools=[]` when calling
+`compose(...).apply(...)`. A bare empty `payload=[]` is ambiguous under the
+current unified-state API.

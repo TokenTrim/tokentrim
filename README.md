@@ -8,9 +8,9 @@ service layer.
 
 Tokentrim exposes a single compose-first API:
 
-- `Tokentrim(...).compose(*steps).apply(payload, ...)`
+- `Tokentrim(...).compose(*steps).apply(...)`
 
-The same runtime supports both payload kinds:
+The same runtime supports both payload tracks:
 
 - context messages
 - tool definitions
@@ -44,7 +44,7 @@ result = tt.compose(
     CompactConversation(model="gpt-4o-mini", keep_last=8),
     RetrieveMemory(),
 ).apply(
-    messages,
+    context=messages,
     user_id="user-123",
     session_id="session-456",
 )
@@ -64,13 +64,13 @@ result = tt.compose(
     CompressToolDescriptions(max_description_chars=160),
     CreateTools(model="gpt-4o-mini"),
 ).apply(
-    tools,
+    tools=tools,
     task_hint="debug a failed database connection",
 )
 optimized_tools = result.tools
 ```
 
-### Context + Tools In One Flow
+### Mixed Pipeline
 
 ```python
 from tokentrim import Tokentrim
@@ -85,43 +85,57 @@ from tokentrim.transforms import (
 
 tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
 
-context_pipeline = tt.compose(
+result = tt.compose(
     FilterMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
     RetrieveMemory(),
-)
-tools_pipeline = tt.compose(
     CompressToolDescriptions(max_description_chars=160),
     CreateTools(model="gpt-4o-mini"),
-)
-
-context_result = context_pipeline.apply(
-    messages,
+).apply(
+    context=messages,
+    tools=tools,
     user_id="user-123",
     session_id="session-456",
-)
-tools_result = tools_pipeline.apply(
-    tools,
     task_hint="debug a failed database connection",
 )
+
+optimized_messages = result.context
+optimized_tools = result.tools
 ```
 
 Use one `Tokentrim` client and one API pattern (`compose(...).apply(...)`) for
 both payload kinds.
 
+For legacy single-payload calls, `apply(payload)` still works for non-empty
+lists. For empty payloads, use `context=[]` or `tools=[]` explicitly.
+
 `tokenizer` is the shared model used for token counting only. Model-backed
 transforms define their own model (for example
 `CompactConversation(model=...)` and `CreateTools(model=...)`).
+
+## Transform Contract
+
+All transforms operate on one shared `PipelineState`:
+
+```python
+PipelineState(
+    context=[...],
+    tools=[...],
+)
+```
+
+Each transform can read or modify either side and returns the next state.
+Tracing and budget enforcement stay in the pipeline runtime.
 
 ## Result Shape
 
 Every run returns one `Result` object:
 
 - `result.trace`: run metadata and per-step trace entries
-- `result.context`: context payload when a context pipeline is executed
-- `result.tools`: tools payload when a tools pipeline is executed
+- `result.context`: final context payload as a tuple
+- `result.tools`: final tools payload as a tuple
 
-Exactly one of `result.context` or `result.tools` is populated for a given run.
+Both fields are always present. Unused sides are empty tuples.
 
 ## Package Map
 
@@ -163,6 +177,10 @@ result = Runner.run_sync(
 
 The current adapter trims plain-text message inputs. Rich Responses items such
 as tool calls, images, and search results are preserved unchanged.
+
+The current adapter is still message-oriented in practice. Tool transforms in a
+pipeline will run, but OpenAI Agents hook inputs only provide message history to
+Tokentrim.
 
 ## Design Notes
 
