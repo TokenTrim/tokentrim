@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.types.message import Message
 
@@ -19,7 +19,7 @@ class FilterMessages(Transform):
     def kind(self) -> str:
         return "context"
 
-    def run(self, messages: list[Message], _request: ContextRequest) -> list[Message]:
+    def run(self, messages: list[Message], _request: PipelineRequest) -> list[Message]:
         filtered = [message for message in messages if message["content"].strip()]
         if not filtered:
             return []

@@ -3,9 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Literal
 
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.types.message import Message
 from tokentrim.types.tool import Tool
-from tokentrim.pipeline.requests import ContextRequest, ToolsRequest
 
 TransformKind = Literal["context", "tools"]
 
@@ -35,6 +35,6 @@ class Transform(ABC):
     def run(
         self,
         payload: list[Message] | list[Tool],
-        request: ContextRequest | ToolsRequest,
+        request: PipelineRequest,
     ) -> list[Message] | list[Tool]:
         """Transform the current payload for the given request."""

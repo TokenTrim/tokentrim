@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.rlm.store import MemoryStore
 from tokentrim.types.message import Message
@@ -22,7 +22,7 @@ class RetrieveMemory(Transform):
     def kind(self) -> str:
         return "context"
 
-    def run(self, messages: list[Message], request: ContextRequest) -> list[Message]:
+    def run(self, messages: list[Message], request: PipelineRequest) -> list[Message]:
         if self.memory_store is None:
             return list(messages)
         if not request.user_id or not request.session_id:

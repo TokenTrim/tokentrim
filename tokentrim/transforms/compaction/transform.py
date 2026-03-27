@@ -8,7 +8,7 @@ from tokentrim.transforms.compaction.error import (
     CompactionConfigurationError,
     CompactionExecutionError,
 )
-from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.types.message import Message
 
@@ -41,7 +41,7 @@ class CompactConversation(Transform):
             ),
         )
 
-    def run(self, messages: list[Message], request: ContextRequest) -> list[Message]:
+    def run(self, messages: list[Message], request: PipelineRequest) -> list[Message]:
         if self.keep_last < 1:
             raise CompactionConfigurationError("Compaction keep_last must be at least 1.")
         if request.token_budget is None:

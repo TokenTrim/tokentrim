@@ -11,17 +11,56 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True)
-class ContextRequest:
-    messages: tuple[Message, ...]
-    user_id: str | None
-    session_id: str | None
-    token_budget: int | None
-    steps: tuple[Transform, ...]
+class PipelineRequest:
+    messages: tuple[Message, ...] = ()
+    tools: tuple[Tool, ...] = ()
+    user_id: str | None = None
+    session_id: str | None = None
+    task_hint: str | None = None
+    token_budget: int | None = None
+    steps: tuple[Transform, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class ToolsRequest:
-    tools: tuple[Tool, ...]
-    task_hint: str | None
-    token_budget: int | None
-    steps: tuple[Transform, ...]
+@dataclass(frozen=True, slots=True, init=False)
+class ContextRequest(PipelineRequest):
+    def __init__(
+        self,
+        *,
+        messages: tuple[Message, ...],
+        user_id: str | None,
+        session_id: str | None,
+        token_budget: int | None,
+        steps: tuple[Transform, ...],
+    ) -> None:
+        PipelineRequest.__init__(
+            self,
+            messages=messages,
+            tools=(),
+            user_id=user_id,
+            session_id=session_id,
+            task_hint=None,
+            token_budget=token_budget,
+            steps=steps,
+        )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ToolsRequest(PipelineRequest):
+    def __init__(
+        self,
+        *,
+        tools: tuple[Tool, ...],
+        task_hint: str | None,
+        token_budget: int | None,
+        steps: tuple[Transform, ...],
+    ) -> None:
+        PipelineRequest.__init__(
+            self,
+            messages=(),
+            tools=tools,
+            user_id=None,
+            session_id=None,
+            task_hint=task_hint,
+            token_budget=token_budget,
+            steps=steps,
+        )

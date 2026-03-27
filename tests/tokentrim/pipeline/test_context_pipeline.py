@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from tokentrim.transforms.base import Transform
-from tokentrim.pipeline import UnifiedPipeline
+from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
 from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
@@ -154,4 +154,44 @@ def test_pipeline_raises_for_unknown_steps() -> None:
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Context steps must be context transforms." in str(exc_info.value)
+    assert "Pipeline steps must be context or tools transforms." in str(exc_info.value)
+
+
+class ToolRecorderStep(Transform):
+    @property
+    def name(self) -> str:
+        return "tool-recorder"
+
+    @property
+    def kind(self) -> str:
+        return "tools"
+
+    def run(self, tools, request):
+        del request
+        return [
+            *tools,
+            {"name": "search", "description": "docs", "input_schema": {}},
+        ]
+
+
+def test_pipeline_runs_mixed_steps_against_shared_request() -> None:
+    pipeline = UnifiedPipeline(tokenizer_model=None)
+    request = PipelineRequest(
+        messages=({"role": "user", "content": "hello"}, {"role": "assistant", "content": "   "}),
+        tools=(),
+        user_id="user",
+        session_id="session",
+        task_hint="investigate",
+        token_budget=1000,
+        steps=(RecorderStep("filter", "filter", []), ToolRecorderStep()),
+    )
+
+    result = pipeline.run(request)
+
+    assert result.context == (
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "   "},
+        {"role": "system", "content": "filter"},
+    )
+    assert result.tools == ({"name": "search", "description": "docs", "input_schema": {}},)
+    assert [trace.step_name for trace in result.trace.steps] == ["filter", "tool-recorder"]

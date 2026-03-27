@@ -152,4 +152,4 @@ def test_tools_pipeline_raises_for_unknown_steps() -> None:
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Tool steps must be tools transforms." in str(exc_info.value)
+    assert "Pipeline steps must be context or tools transforms." in str(exc_info.value)

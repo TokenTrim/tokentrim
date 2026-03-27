@@ -214,13 +214,39 @@ def test_compose_apply_tools_wires_bpe_and_creator(
     assert result.trace.output_tokens >= result.trace.input_tokens
 
 
-def test_compose_rejects_mixed_context_and_tool_steps() -> None:
+def test_compose_apply_supports_mixed_context_and_tool_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = Tokentrim()
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "   "},
+    ]
+    tools = [
+        {
+            "name": "search",
+            "description": "search   docs",
+            "input_schema": {"type": "object"},
+        }
+    ]
 
-    with pytest.raises(TokentrimError) as exc_info:
-        client.compose(FilterMessages(), CompressToolDescriptions())
+    monkeypatch.setattr(
+        "tokentrim.transforms.create_tools.transform.generate_text",
+        lambda **kwargs: '{"tools": [{"name": "lookup", "description": "new tool", "input_schema": {}}]}',
+    )
+    result = client.compose(
+        FilterMessages(),
+        CompressToolDescriptions(),
+        CreateTools(model="creator-model"),
+    ).apply(
+        context=messages,
+        tools=tools,
+        task_hint="investigate",
+    )
 
-    assert "cannot mix context and tool steps" in str(exc_info.value)
+    assert result.context == ({"role": "user", "content": "hello"},)
+    assert [tool["name"] for tool in result.tools] == ["search", "lookup"]
+    assert [trace.step_name for trace in result.trace.steps] == ["filter", "bpe", "creator"]
 
 
 def test_compose_apply_rejects_empty_payload_when_no_steps() -> None:

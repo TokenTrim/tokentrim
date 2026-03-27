@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from tokentrim.core.copy_utils import freeze_messages, freeze_tools
 from tokentrim.errors.base import TokentrimError
-from tokentrim.pipeline import ContextRequest, ToolsRequest, UnifiedPipeline
+from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
 from tokentrim.types.message import Message
 from tokentrim.types.result import Result
 from tokentrim.types.tool import Tool
@@ -18,16 +18,15 @@ if TYPE_CHECKING:
 
 
 AdapterConfigT = TypeVar("AdapterConfigT")
-PayloadKind = Literal["context", "tools"]
+PayloadKind = Literal["context", "tools", "mixed"]
 
 
 class ComposedPipeline:
     """
     Unified compose-first pipeline.
 
-    A composed pipeline contains either context steps or tool steps. `apply(...)`
-    runs the correct internal pipeline based on step type (or payload shape when
-    no steps are provided).
+    A composed pipeline can contain context steps, tool steps, or both.
+    `apply(...)` runs the composed steps against a shared request.
     """
 
     def __init__(
@@ -46,40 +45,66 @@ class ComposedPipeline:
 
     def apply(
         self,
-        payload: list[Message] | list[Tool],
+        payload: list[Message] | list[Tool] | None = None,
         *,
+        context: list[Message] | None = None,
+        tools: list[Tool] | None = None,
         user_id: str | None = None,
         session_id: str | None = None,
         task_hint: str | None = None,
         token_budget: int | None = None,
     ) -> Result:
         """
-        Apply composed steps to the provided payload.
+        Apply composed steps to the provided payload or payloads.
 
-        Context runs use `user_id` and `session_id`.
-        Tool runs use `task_hint`.
+        `payload` preserves the single-input API.
+        `context=` and `tools=` allow mixed pipelines in one call.
         """
         effective_budget = (
             token_budget if token_budget is not None else self._default_token_budget
         )
-        kind = self._kind or self._infer_kind_from_payload(payload)
-        if kind == "context":
-            request = ContextRequest(
-                messages=freeze_messages(cast(list[Message], payload)),
-                user_id=user_id,
-                session_id=session_id,
-                token_budget=effective_budget,
-                steps=self._steps,
-            )
-            return self._pipeline.run(request)
-
-        request = ToolsRequest(
-            tools=freeze_tools(cast(list[Tool], payload)),
+        normalized_context, normalized_tools = self._normalize_payloads(
+            payload=payload,
+            context=context,
+            tools=tools,
+        )
+        request = PipelineRequest(
+            messages=freeze_messages(normalized_context),
+            tools=freeze_tools(normalized_tools),
+            user_id=user_id,
+            session_id=session_id,
             task_hint=task_hint,
             token_budget=effective_budget,
             steps=self._steps,
         )
         return self._pipeline.run(request)
+
+    def _normalize_payloads(
+        self,
+        *,
+        payload: list[Message] | list[Tool] | None,
+        context: list[Message] | None,
+        tools: list[Tool] | None,
+    ) -> tuple[list[Message], list[Tool]]:
+        if payload is not None and (context is not None or tools is not None):
+            raise TokentrimError(
+                "compose(...).apply(...) accepts either `payload` or `context=`/`tools=`, not both."
+            )
+
+        if payload is not None:
+            kind = self._kind
+            if kind is None:
+                kind = self._infer_kind_from_payload(payload)
+            if kind == "tools":
+                return [], cast(list[Tool], payload)
+            return cast(list[Message], payload), []
+
+        if context is not None or tools is not None:
+            return list(context or []), list(tools or [])
+
+        raise TokentrimError(
+            "compose(...).apply(...) requires `payload` or at least one of `context=`/`tools=`."
+        )
 
     def _resolve_kind_from_steps(
         self,
@@ -91,8 +116,10 @@ class ComposedPipeline:
         first_kind = steps[0].kind
         if first_kind not in ("context", "tools"):
             raise TokentrimError("compose(...) received an unsupported step object.")
+        if any(step.kind not in ("context", "tools") for step in steps):
+            raise TokentrimError("compose(...) received an unsupported step object.")
         if any(step.kind != first_kind for step in steps):
-            raise TokentrimError("compose(...) cannot mix context and tool steps.")
+            return "mixed"
 
         return cast(PayloadKind, first_kind)
 
@@ -139,7 +166,7 @@ class ComposedPipeline:
         By default this only installs `call_model_input_filter`. Session and
         handoff hooks are opt-in to keep behavior predictable.
         """
-        if self._kind == "tools":
+        if any(step.kind == "tools" for step in self._steps):
             raise TokentrimError(
                 "compose(...).to_openai_agents(...) supports context transforms only."
             )

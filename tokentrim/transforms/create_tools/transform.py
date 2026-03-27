@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from tokentrim.core.llm_client import generate_text
 from tokentrim.types.tool import Tool
-from tokentrim.pipeline.requests import ToolsRequest
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.create_tools.error import (
     ToolCreationConfigurationError,
@@ -36,7 +36,7 @@ class CreateTools(Transform):
         del tokenizer_model
         return self
 
-    def run(self, tools: list[Tool], request: ToolsRequest) -> list[Tool]:
+    def run(self, tools: list[Tool], request: PipelineRequest) -> list[Tool]:
         if not tools and not request.task_hint:
             return []
         if not self.model:

@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from tokentrim.types.tool import Tool
-from tokentrim.pipeline.requests import ToolsRequest
+from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 
 
@@ -22,7 +22,7 @@ class CompressToolDescriptions(Transform):
     def kind(self) -> str:
         return "tools"
 
-    def run(self, tools: list[Tool], _request: ToolsRequest) -> list[Tool]:
+    def run(self, tools: list[Tool], _request: PipelineRequest) -> list[Tool]:
         return [self._compress(tool) for tool in tools]
 
     def _compress(self, tool: Tool) -> Tool:
