@@ -6,6 +6,7 @@ from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.rlm.store import MemoryStore
 from tokentrim.types.message import Message
+from tokentrim.types.state import PipelineState
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,25 +19,22 @@ class RetrieveMemory(Transform):
     def name(self) -> str:
         return "rlm"
 
-    @property
-    def kind(self) -> str:
-        return "context"
-
-    def run(self, messages: list[Message], request: PipelineRequest) -> list[Message]:
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        messages = state.context
         if self.memory_store is None:
-            return list(messages)
+            return state
         if not request.user_id or not request.session_id:
-            return list(messages)
+            return state
 
         retrieved = self.memory_store.retrieve(
             user_id=request.user_id,
             session_id=request.session_id,
         )
         if not retrieved:
-            return list(messages)
+            return state
 
         injection: Message = {
             "role": "system",
             "content": retrieved,
         }
-        return [injection, *messages]
+        return PipelineState(context=[injection, *messages], tools=state.tools)

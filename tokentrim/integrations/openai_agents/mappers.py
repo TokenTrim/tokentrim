@@ -55,8 +55,6 @@ def trim_input_items(
         session_id=options.session_id,
         token_budget=options.token_budget,
     )
-    if result.context is None:
-        return list(items)
     return [message_to_input_item(message) for message in result.context]
 
 

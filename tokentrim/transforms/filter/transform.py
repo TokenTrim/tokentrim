@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
-from tokentrim.types.message import Message
+from tokentrim.types.state import PipelineState
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,16 +15,12 @@ class FilterMessages(Transform):
     def name(self) -> str:
         return "filter"
 
-    @property
-    def kind(self) -> str:
-        return "context"
-
-    def run(self, messages: list[Message], _request: PipelineRequest) -> list[Message]:
-        filtered = [message for message in messages if message["content"].strip()]
+    def run(self, state: PipelineState, _request: PipelineRequest) -> PipelineState:
+        filtered = [message for message in state.context if message["content"].strip()]
         if not filtered:
-            return []
+            return PipelineState(context=[], tools=state.tools)
 
-        result: list[Message] = []
+        result = []
         index = 0
         while index < len(filtered):
             current = filtered[index]
@@ -47,4 +43,4 @@ class FilterMessages(Transform):
             result.append({"role": current["role"], "content": content})
             index += run_length
 
-        return result
+        return PipelineState(context=result, tools=state.tools)

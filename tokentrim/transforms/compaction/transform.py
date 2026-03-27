@@ -11,6 +11,7 @@ from tokentrim.transforms.compaction.error import (
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.types.message import Message
+from tokentrim.types.state import PipelineState
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,10 +26,6 @@ class CompactConversation(Transform):
     def name(self) -> str:
         return "compaction"
 
-    @property
-    def kind(self) -> str:
-        return "context"
-
     def resolve(
         self,
         *,
@@ -41,15 +38,16 @@ class CompactConversation(Transform):
             ),
         )
 
-    def run(self, messages: list[Message], request: PipelineRequest) -> list[Message]:
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        messages = state.context
         if self.keep_last < 1:
             raise CompactionConfigurationError("Compaction keep_last must be at least 1.")
         if request.token_budget is None:
-            return list(messages)
+            return state
         if len(messages) <= self.keep_last:
-            return list(messages)
+            return state
         if count_message_tokens(messages, self.tokenizer_model) <= request.token_budget:
-            return list(messages)
+            return state
         if not self.model:
             raise CompactionConfigurationError(
                 "Compaction is enabled but no compaction model is configured."
@@ -58,7 +56,10 @@ class CompactConversation(Transform):
         to_compact = messages[: -self.keep_last]
         recent = messages[-self.keep_last :]
         summary = self._compress(to_compact)
-        return [{"role": "system", "content": summary}, *recent]
+        return PipelineState(
+            context=[{"role": "system", "content": summary}, *recent],
+            tools=state.tools,
+        )
 
     def _compress(self, messages: list[Message]) -> str:
         history = "\n".join(f"{message['role']}: {message['content']}" for message in messages)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -51,7 +52,7 @@ def test_default_token_budget_propagates_to_compose_apply(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    result = client.compose(FilterMessages()).apply([])
+    result = client.compose(FilterMessages()).apply(context=[])
 
     assert captured["token_budget"] == 123
     assert result.trace.id == "trace"
@@ -68,7 +69,6 @@ def test_rlm_store_belongs_to_rlm_transform() -> None:
         session_id="s1",
     )
 
-    assert result.context is not None
     assert result.context[0] == {"role": "system", "content": "stored context"}
 
 
@@ -98,7 +98,7 @@ def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    result = client.compose(CompressToolDescriptions()).apply([], token_budget=9)
+    result = client.compose(CompressToolDescriptions()).apply(tools=[], token_budget=9)
 
     assert captured["token_budget"] == 9
     assert result.trace.id == "trace"
@@ -115,8 +115,8 @@ def test_wrap_integration_delegates_to_adapter() -> None:
 def test_compose_apply_returns_frozen_result_objects() -> None:
     client = Tokentrim()
 
-    context_result = client.compose(FilterMessages()).apply([])
-    tools_result = client.compose(CompressToolDescriptions()).apply([])
+    context_result = client.compose(FilterMessages()).apply(context=[])
+    tools_result = client.compose(CompressToolDescriptions()).apply(tools=[])
 
     with pytest.raises((FrozenInstanceError, TypeError)):
         context_result.trace.id = "other"
@@ -258,10 +258,15 @@ def test_compose_apply_rejects_empty_payload_when_no_steps() -> None:
     assert "cannot infer payload kind" in str(exc_info.value)
 
 
-def test_compose_to_openai_agents_rejects_tools_transforms() -> None:
+def test_compose_to_openai_agents_builds_run_config_for_any_pipeline() -> None:
     client = Tokentrim()
 
-    with pytest.raises(TokentrimError) as exc_info:
-        client.compose(CompressToolDescriptions()).to_openai_agents()
+    if importlib.util.find_spec("agents") is None:
+        with pytest.raises(TokentrimError) as exc_info:
+            client.compose(CompressToolDescriptions()).to_openai_agents()
+        assert "openai-agents is required" in str(exc_info.value)
+        return
 
-    assert "supports context transforms only" in str(exc_info.value)
+    wrapped = client.compose(CompressToolDescriptions()).to_openai_agents()
+
+    assert wrapped.call_model_input_filter is not None

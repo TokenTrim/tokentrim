@@ -3,6 +3,7 @@ from __future__ import annotations
 from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.transforms.rlm import RetrieveMemory
 from tokentrim.transforms.rlm.store import NoOpMemoryStore
+from tokentrim.types.state import PipelineState
 
 
 class FakeStore:
@@ -29,27 +30,27 @@ def test_rlm_is_noop_without_identifiers() -> None:
     step = RetrieveMemory(memory_store=NoOpMemoryStore())
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, _request(user_id=None, session_id="session"))
+    result = step.run(PipelineState(context=messages, tools=[]), _request(user_id=None, session_id="session"))
 
-    assert result == messages
+    assert result.context == messages
 
 
 def test_rlm_is_noop_without_retrieved_state() -> None:
     step = RetrieveMemory(memory_store=FakeStore(None))
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, _request(user_id="user", session_id="session"))
+    result = step.run(PipelineState(context=messages, tools=[]), _request(user_id="user", session_id="session"))
 
-    assert result == messages
+    assert result.context == messages
 
 
 def test_rlm_prepends_retrieved_state() -> None:
     step = RetrieveMemory(memory_store=FakeStore("remember this"))
     messages = [{"role": "user", "content": "hello"}]
 
-    result = step.run(messages, _request(user_id="user", session_id="session"))
+    result = step.run(PipelineState(context=messages, tools=[]), _request(user_id="user", session_id="session"))
 
-    assert result == [
+    assert result.context == [
         {"role": "system", "content": "remember this"},
         {"role": "user", "content": "hello"},
     ]
@@ -60,7 +61,7 @@ def test_rlm_calls_store_with_exact_identifiers() -> None:
     step = RetrieveMemory(memory_store=store)
 
     step.run(
-        [{"role": "user", "content": "hello"}],
+        PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
         _request(user_id="user-1", session_id="session-1"),
     )
 

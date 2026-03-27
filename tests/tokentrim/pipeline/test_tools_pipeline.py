@@ -7,6 +7,7 @@ from tokentrim.errors.budget import BudgetExceededError
 from tokentrim.transforms.base import Transform
 from tokentrim.pipeline import UnifiedPipeline
 from tokentrim.pipeline.requests import ToolsRequest
+from tokentrim.types.state import PipelineState
 
 
 class RecorderStep(Transform):
@@ -19,21 +20,20 @@ class RecorderStep(Transform):
     def name(self) -> str:
         return self._name
 
-    @property
-    def kind(self) -> str:
-        return "tools"
-
-    def run(self, tools, request):
+    def run(self, state, request):
         del request
         self._calls.append(self._name)
-        return [
-            *tools,
-            {
-                "name": self._name,
-                "description": self._description,
-                "input_schema": {},
-            },
-        ]
+        return PipelineState(
+            context=state.context,
+            tools=[
+                *state.tools,
+                {
+                    "name": self._name,
+                    "description": self._description,
+                    "input_schema": {},
+                },
+            ],
+        )
 
 
 class CreatorRecorder(Transform):
@@ -44,21 +44,20 @@ class CreatorRecorder(Transform):
     def name(self) -> str:
         return "creator"
 
-    @property
-    def kind(self) -> str:
-        return "tools"
-
-    def run(self, tools, request):
+    def run(self, state, request):
         del request
         self._calls.append("creator")
-        return [
-            *tools,
-            {
-                "name": "generated",
-                "description": "generated description",
-                "input_schema": {},
-            }
-        ]
+        return PipelineState(
+            context=state.context,
+            tools=[
+                *state.tools,
+                {
+                    "name": "generated",
+                    "description": "generated description",
+                    "input_schema": {},
+                },
+            ],
+        )
 
 
 def test_tools_pipeline_runs_steps_in_order() -> None:
@@ -152,4 +151,4 @@ def test_tools_pipeline_raises_for_unknown_steps() -> None:
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Pipeline steps must be context or tools transforms." in str(exc_info.value)
+    assert "Pipeline steps must be transforms." in str(exc_info.value)

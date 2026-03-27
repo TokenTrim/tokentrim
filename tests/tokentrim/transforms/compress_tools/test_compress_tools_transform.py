@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from tokentrim.transforms.compress_tools import CompressToolDescriptions
 from tokentrim.pipeline.requests import ToolsRequest
+from tokentrim.transforms.compress_tools import CompressToolDescriptions
+from tokentrim.types.state import PipelineState
 
 
 def _request() -> ToolsRequest:
@@ -21,7 +22,7 @@ def test_bpe_normalizes_whitespace_and_preserves_schema() -> None:
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool], _request())[0]
+    result = step.run(PipelineState(context=[], tools=[tool]), _request()).tools[0]
 
     assert result["name"] == "search"
     assert result["description"] == "search the knowledge base"
@@ -36,7 +37,7 @@ def test_bpe_returns_new_objects_and_deep_copies_schema() -> None:
         "input_schema": {"properties": {"query": {"type": "string"}}},
     }
 
-    result = step.run([tool], _request())[0]
+    result = step.run(PipelineState(context=[], tools=[tool]), _request()).tools[0]
     result["input_schema"]["properties"]["query"]["type"] = "number"
 
     assert result is not tool
@@ -51,7 +52,7 @@ def test_bpe_trims_long_descriptions() -> None:
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool], _request())[0]
+    result = step.run(PipelineState(context=[], tools=[tool]), _request()).tools[0]
 
     assert len(result["description"]) == 200
     assert result["description"].endswith("...")
@@ -65,6 +66,6 @@ def test_bpe_leaves_short_description_text_unchanged_after_normalization() -> No
         "input_schema": {"type": "object"},
     }
 
-    result = step.run([tool], _request())[0]
+    result = step.run(PipelineState(context=[], tools=[tool]), _request()).tools[0]
 
     assert result["description"] == "already short"

@@ -4,7 +4,6 @@ import json
 from dataclasses import dataclass
 
 from tokentrim.core.llm_client import generate_text
-from tokentrim.types.tool import Tool
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.create_tools.error import (
@@ -12,6 +11,8 @@ from tokentrim.transforms.create_tools.error import (
     ToolCreationExecutionError,
     ToolCreationOutputError,
 )
+from tokentrim.types.state import PipelineState
+from tokentrim.types.tool import Tool
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,10 +25,6 @@ class CreateTools(Transform):
     def name(self) -> str:
         return "creator"
 
-    @property
-    def kind(self) -> str:
-        return "tools"
-
     def resolve(
         self,
         *,
@@ -36,9 +33,10 @@ class CreateTools(Transform):
         del tokenizer_model
         return self
 
-    def run(self, tools: list[Tool], request: PipelineRequest) -> list[Tool]:
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        tools = state.tools
         if not tools and not request.task_hint:
-            return []
+            return PipelineState(context=state.context, tools=[])
         if not self.model:
             raise ToolCreationConfigurationError(
                 "Tool creation is enabled but no tool creation model is configured."
@@ -64,7 +62,7 @@ class CreateTools(Transform):
             existing_names.add(tool["name"])
             created.append(tool)
 
-        return [*tools, *created]
+        return PipelineState(context=state.context, tools=[*tools, *created])
 
     def _generate(self, tools: list[Tool], *, task_hint: str | None) -> str:
         tool_text = json.dumps(tools, sort_keys=True)

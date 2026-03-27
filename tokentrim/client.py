@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 from tokentrim.core.copy_utils import freeze_messages, freeze_tools
 from tokentrim.errors.base import TokentrimError
@@ -18,15 +18,13 @@ if TYPE_CHECKING:
 
 
 AdapterConfigT = TypeVar("AdapterConfigT")
-PayloadKind = Literal["context", "tools", "mixed"]
 
 
 class ComposedPipeline:
     """
     Unified compose-first pipeline.
 
-    A composed pipeline can contain context steps, tool steps, or both.
-    `apply(...)` runs the composed steps against a shared request.
+    A composed pipeline runs all steps against a shared request state.
     """
 
     def __init__(
@@ -41,7 +39,6 @@ class ComposedPipeline:
         self._steps = steps
         self._pipeline = pipeline
         self._default_token_budget = default_token_budget
-        self._kind: PayloadKind | None = self._resolve_kind_from_steps(steps)
 
     def apply(
         self,
@@ -92,9 +89,7 @@ class ComposedPipeline:
             )
 
         if payload is not None:
-            kind = self._kind
-            if kind is None:
-                kind = self._infer_kind_from_payload(payload)
+            kind = self._infer_kind_from_payload(payload)
             if kind == "tools":
                 return [], cast(list[Tool], payload)
             return cast(list[Message], payload), []
@@ -106,24 +101,7 @@ class ComposedPipeline:
             "compose(...).apply(...) requires `payload` or at least one of `context=`/`tools=`."
         )
 
-    def _resolve_kind_from_steps(
-        self,
-        steps: tuple[Transform, ...],
-    ) -> PayloadKind | None:
-        if not steps:
-            return None
-
-        first_kind = steps[0].kind
-        if first_kind not in ("context", "tools"):
-            raise TokentrimError("compose(...) received an unsupported step object.")
-        if any(step.kind not in ("context", "tools") for step in steps):
-            raise TokentrimError("compose(...) received an unsupported step object.")
-        if any(step.kind != first_kind for step in steps):
-            return "mixed"
-
-        return cast(PayloadKind, first_kind)
-
-    def _infer_kind_from_payload(self, payload: list[Message] | list[Tool]) -> PayloadKind:
+    def _infer_kind_from_payload(self, payload: list[Message] | list[Tool]) -> str:
         if not isinstance(payload, list):
             raise TokentrimError("compose(...).apply(...) payload must be a list.")
         if not payload:
@@ -166,11 +144,6 @@ class ComposedPipeline:
         By default this only installs `call_model_input_filter`. Session and
         handoff hooks are opt-in to keep behavior predictable.
         """
-        if any(step.kind == "tools" for step in self._steps):
-            raise TokentrimError(
-                "compose(...).to_openai_agents(...) supports context transforms only."
-            )
-
         effective_budget = (
             token_budget if token_budget is not None else self._default_token_budget
         )

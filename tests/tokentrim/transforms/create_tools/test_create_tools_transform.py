@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from tokentrim.errors.base import TokentrimError
-from tokentrim.transforms.create_tools import CreateTools
 from tokentrim.pipeline.requests import ToolsRequest
+from tokentrim.transforms.create_tools import CreateTools
+from tokentrim.types.state import PipelineState
 
 
 def _request(*, task_hint: str | None) -> ToolsRequest:
@@ -36,9 +37,9 @@ def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
     )
 
-    result = step.run(tools, _request(task_hint="investigate"))
+    result = step.run(PipelineState(context=[], tools=tools), _request(task_hint="investigate"))
 
-    assert result == [
+    assert result.tools == [
         {
             "name": "search",
             "description": "search docs",
@@ -55,16 +56,16 @@ def test_creator_drops_duplicate_names(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_creator_is_noop_when_no_tools_and_no_task_hint() -> None:
     step = CreateTools(model="creator-model")
 
-    result = step.run([], _request(task_hint=None))
+    result = step.run(PipelineState(context=[], tools=[]), _request(task_hint=None))
 
-    assert result == []
+    assert result.tools == []
 
 
 def test_creator_raises_when_model_is_missing() -> None:
     step = CreateTools(model=None)
 
     with pytest.raises(TokentrimError) as exc_info:
-        step.run([], _request(task_hint="investigate"))
+        step.run(PipelineState(context=[], tools=[]), _request(task_hint="investigate"))
 
     assert "no tool creation model" in str(exc_info.value)
 
@@ -78,7 +79,7 @@ def test_creator_raises_for_invalid_json(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], _request(task_hint="investigate"))
+        step.run(PipelineState(context=[], tools=[]), _request(task_hint="investigate"))
 
 
 def test_creator_raises_for_invalid_top_level_payload(
@@ -92,7 +93,7 @@ def test_creator_raises_for_invalid_top_level_payload(
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], _request(task_hint="investigate"))
+        step.run(PipelineState(context=[], tools=[]), _request(task_hint="investigate"))
 
 
 def test_creator_raises_for_invalid_tool_entries(
@@ -106,7 +107,7 @@ def test_creator_raises_for_invalid_tool_entries(
     )
 
     with pytest.raises(TokentrimError):
-        step.run([], _request(task_hint="investigate"))
+        step.run(PipelineState(context=[], tools=[]), _request(task_hint="investigate"))
 
 
 def test_creator_deduplicates_repeated_generated_names(
@@ -124,9 +125,9 @@ def test_creator_deduplicates_repeated_generated_names(
         ),
     )
 
-    result = step.run([], _request(task_hint="investigate"))
+    result = step.run(PipelineState(context=[], tools=[]), _request(task_hint="investigate"))
 
-    assert result == [
+    assert result.tools == [
         {
             "name": "lookup",
             "description": "first",

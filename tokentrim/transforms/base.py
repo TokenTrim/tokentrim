@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal
 
 from tokentrim.pipeline.requests import PipelineRequest
-from tokentrim.types.message import Message
-from tokentrim.types.tool import Tool
-
-TransformKind = Literal["context", "tools"]
+from tokentrim.types.state import PipelineState
 
 
 class Transform(ABC):
@@ -17,11 +13,6 @@ class Transform(ABC):
     @abstractmethod
     def name(self) -> str:
         """Stable identifier for selecting and tracing this transform."""
-
-    @property
-    @abstractmethod
-    def kind(self) -> TransformKind:
-        """Payload kind handled by this transform."""
 
     def resolve(
         self,
@@ -34,7 +25,7 @@ class Transform(ABC):
     @abstractmethod
     def run(
         self,
-        payload: list[Message] | list[Tool],
+        state: PipelineState,
         request: PipelineRequest,
-    ) -> list[Message] | list[Tool]:
-        """Transform the current payload for the given request."""
+    ) -> PipelineState:
+        """Transform the current pipeline state for the given request."""

@@ -7,6 +7,7 @@ from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
 from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
+from tokentrim.types.state import PipelineState
 
 
 class RecorderStep(Transform):
@@ -19,14 +20,13 @@ class RecorderStep(Transform):
     def name(self) -> str:
         return self._name
 
-    @property
-    def kind(self) -> str:
-        return "context"
-
-    def run(self, messages, request):
+    def run(self, state, request):
         del request
         self._calls.append(self._name)
-        return [*messages, {"role": "system", "content": self._marker}]
+        return PipelineState(
+            context=[*state.context, {"role": "system", "content": self._marker}],
+            tools=state.tools,
+        )
 
 
 def test_pipeline_runs_steps_in_order() -> None:
@@ -154,7 +154,7 @@ def test_pipeline_raises_for_unknown_steps() -> None:
     with pytest.raises(TokentrimError) as exc_info:
         pipeline.run(request)
 
-    assert "Pipeline steps must be context or tools transforms." in str(exc_info.value)
+    assert "Pipeline steps must be transforms." in str(exc_info.value)
 
 
 class ToolRecorderStep(Transform):
@@ -162,16 +162,12 @@ class ToolRecorderStep(Transform):
     def name(self) -> str:
         return "tool-recorder"
 
-    @property
-    def kind(self) -> str:
-        return "tools"
-
-    def run(self, tools, request):
+    def run(self, state, request):
         del request
-        return [
-            *tools,
-            {"name": "search", "description": "docs", "input_schema": {}},
-        ]
+        return PipelineState(
+            context=state.context,
+            tools=[*state.tools, {"name": "search", "description": "docs", "input_schema": {}}],
+        )
 
 
 def test_pipeline_runs_mixed_steps_against_shared_request() -> None:

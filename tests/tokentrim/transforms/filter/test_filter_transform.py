@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from tokentrim.transforms.filter import FilterMessages
 from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.transforms.filter import FilterMessages
+from tokentrim.types.state import PipelineState
 
 
 def _request() -> ContextRequest:
@@ -22,9 +23,9 @@ def test_filter_removes_empty_messages() -> None:
         {"role": "assistant", "content": ""},
     ]
 
-    result = step.run(messages, _request())
+    result = step.run(PipelineState(context=messages, tools=[]), _request())
 
-    assert result == [{"role": "user", "content": "hello"}]
+    assert result.context == [{"role": "user", "content": "hello"}]
 
 
 def test_filter_collapses_consecutive_duplicates() -> None:
@@ -35,9 +36,9 @@ def test_filter_collapses_consecutive_duplicates() -> None:
         {"role": "user", "content": "click"},
     ]
 
-    result = step.run(messages, _request())
+    result = step.run(PipelineState(context=messages, tools=[]), _request())
 
-    assert result == [{"role": "user", "content": "click [repeated 3x]"}]
+    assert result.context == [{"role": "user", "content": "click [repeated 3x]"}]
 
 
 def test_filter_preserves_non_consecutive_duplicates() -> None:
@@ -48,6 +49,6 @@ def test_filter_preserves_non_consecutive_duplicates() -> None:
         {"role": "user", "content": "click"},
     ]
 
-    result = step.run(messages, _request())
+    result = step.run(PipelineState(context=messages, tools=[]), _request())
 
-    assert result == messages
+    assert result.context == messages
