@@ -21,6 +21,12 @@ The same runtime supports both payload tracks:
 pip install tokentrim
 ```
 
+If you plan to use the OpenAI Agents integration:
+
+```bash
+pip install "tokentrim[openai-agents]"
+```
+
 For development:
 
 ```bash
@@ -137,10 +143,31 @@ Every run returns one `Result` object:
 
 Both fields are always present. Unused sides are empty tuples.
 
+`result.trace` is the synchronous pipeline trace for that one Tokentrim run.
+It is not the same as the persisted identity trace store used by integrations.
+
+## Stored Traces
+
+Tokentrim also supports persisted canonical trace history through:
+
+- `TraceStore`
+- `InMemoryTraceStore`
+- `TokentrimTraceRecord`
+- `TokentrimSpanRecord`
+
+This is currently used by the OpenAI Agents integration. Stored traces are
+scoped by `user_id + session_id` and include canonicalized span records for:
+
+- native OpenAI Agents spans
+- Tokentrim transform spans emitted while a wrapped OpenAI run is active
+
+Stored traces are additive. They do not replace `result.trace`.
+
 ## Package Map
 
 - `tokentrim/client.py`: `Tokentrim` facade + composed pipeline API
 - `tokentrim/pipeline/`: requests + unified pipeline runtime
+- `tokentrim/tracing/`: canonical persisted trace records, stores, and pipeline tracer interfaces
 - `tokentrim/transforms/`: domain transforms (`filter`, `compaction`, `rlm`, `compress_tools`, `create_tools`)
 - `tokentrim/core/`: shared helpers (`copy_utils`, `token_counting`, `llm_client`)
 - `tokentrim/types/`: payload/result/trace datatypes
@@ -152,11 +179,12 @@ Both fields are always present. Unused sides are empty tuples.
 ```python
 from agents import Agent, Runner
 
-from tokentrim import Tokentrim
+from tokentrim import InMemoryTraceStore, Tokentrim
 from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini")
+trace_store = InMemoryTraceStore()
 
 run_config = tt.compose(
     FilterMessages(),
@@ -166,12 +194,18 @@ run_config = tt.compose(
     token_budget=8000,
     user_id="user-123",
     session_id="session-456",
+    trace_store=trace_store,
 )
 
 result = Runner.run_sync(
     Agent(name="Assistant", instructions="Answer concisely."),
     "Summarise the last discussion.",
     run_config=run_config,
+)
+
+stored_traces = trace_store.list_traces(
+    user_id="user-123",
+    session_id="session-456",
 )
 ```
 
@@ -181,6 +215,10 @@ as tool calls, images, and search results are preserved unchanged.
 The current adapter is still message-oriented in practice. Tool transforms in a
 pipeline will run, but OpenAI Agents hook inputs only provide message history to
 Tokentrim.
+
+If `trace_store` is provided, both `user_id` and `session_id` are required.
+Stored traces include canonical OpenAI spans plus Tokentrim transform spans
+such as `compaction` when those transforms run inside an active OpenAI trace.
 
 ## Design Notes
 
