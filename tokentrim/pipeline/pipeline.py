@@ -8,6 +8,11 @@ from tokentrim.core.token_counting import count_message_tokens, count_tool_token
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
 from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.tracing import (
+    build_transform_span_data,
+    build_transform_span_name,
+    resolve_pipeline_tracer,
+)
 from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.step_trace import StepTrace
@@ -47,6 +52,7 @@ class UnifiedPipeline:
             tools=clone_tools(request.tools),
         )
         input_tokens = self._count_total_tokens(state)
+        pipeline_tracer = resolve_pipeline_tracer(request.pipeline_tracer)
 
         for step in request.steps:
             if not isinstance(step, Transform):
@@ -58,16 +64,43 @@ class UnifiedPipeline:
                 tools=clone_tools(state.tools),
             )
             before_tokens = self._count_total_tokens(before_state)
-            state = resolved_step.run(state, request)
-            after_tokens = self._count_total_tokens(state)
+            input_items = len(before_state.context) + len(before_state.tools)
+            with pipeline_tracer.start_span(
+                name=build_transform_span_name(resolved_step.name),
+                data=build_transform_span_data(
+                    transform_name=resolved_step.name,
+                    token_budget=request.token_budget,
+                    input_items=input_items,
+                    input_tokens=before_tokens,
+                ),
+            ) as transform_span:
+                try:
+                    state = resolved_step.run(state, request)
+                except Exception as exc:
+                    transform_span.set_error(exc)
+                    raise
+                after_tokens = self._count_total_tokens(state)
+                output_items = len(state.context) + len(state.tools)
+                changed = state != before_state
+                transform_span.set_data(
+                    build_transform_span_data(
+                        transform_name=resolved_step.name,
+                        token_budget=request.token_budget,
+                        input_items=input_items,
+                        input_tokens=before_tokens,
+                        output_items=output_items,
+                        output_tokens=after_tokens,
+                        changed=changed,
+                    )
+                )
             step_traces.append(
                 StepTrace(
                     step_name=resolved_step.name,
-                    input_items=len(before_state.context) + len(before_state.tools),
-                    output_items=len(state.context) + len(state.tools),
+                    input_items=input_items,
+                    output_items=output_items,
                     input_tokens=before_tokens,
                     output_tokens=after_tokens,
-                    changed=state != before_state,
+                    changed=changed,
                 )
             )
 

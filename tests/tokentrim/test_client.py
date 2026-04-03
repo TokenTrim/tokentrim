@@ -4,14 +4,20 @@ import importlib.util
 from dataclasses import FrozenInstanceError
 
 import pytest
+import tokentrim as tokentrim_module
+import tokentrim.tracing as tracing_module
 
 from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
+from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.tracing import InMemoryTraceStore, PipelineSpan, PipelineTracer
 from tokentrim.types.result import Result
+from tokentrim.types.state import PipelineState
 from tokentrim.types.trace import Trace
 from tokentrim.transforms import CompactConversation, CompressToolDescriptions, CreateTools
 from tokentrim.transforms import FilterMessages, RetrieveMemory
+from tokentrim.transforms.base import Transform
 
 
 class InMemoryStore:
@@ -25,6 +31,49 @@ class EchoAdapter(IntegrationAdapter[str]):
     def wrap(self, tokentrim: Tokentrim, config: str | None = None) -> str:
         assert isinstance(tokentrim, Tokentrim)
         return config or "default"
+
+
+class RecordingPipelineSpan(PipelineSpan):
+    def __init__(self, name: str, data: dict[str, object]) -> None:
+        self.name = name
+        self.data = dict(data)
+        self.error: str | None = None
+
+    def __enter__(self) -> PipelineSpan:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool | None:
+        del exc_type
+        del exc_val
+        del exc_tb
+        return None
+
+    def set_data(self, data) -> None:
+        self.data = dict(data)
+
+    def set_error(self, error: BaseException) -> None:
+        self.error = error.__class__.__name__
+
+
+class RecordingPipelineTracer(PipelineTracer):
+    def __init__(self) -> None:
+        self.spans: list[RecordingPipelineSpan] = []
+
+    def start_span(self, *, name: str, data=None) -> PipelineSpan:
+        span = RecordingPipelineSpan(name=name, data=dict(data or {}))
+        self.spans.append(span)
+        return span
+
+
+class ExplodingTransform(Transform):
+    @property
+    def name(self) -> str:
+        return "explode"
+
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        del state
+        del request
+        raise RuntimeError("boom")
 
 
 def test_constructor_wires_tokenizer_model() -> None:
@@ -56,6 +105,56 @@ def test_default_token_budget_propagates_to_compose_apply(monkeypatch: pytest.Mo
 
     assert captured["token_budget"] == 123
     assert result.trace.id == "trace"
+
+
+def test_compose_apply_propagates_trace_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = Tokentrim()
+    trace_store = InMemoryTraceStore()
+    captured = {}
+
+    def fake_run(request):
+        captured["trace_store"] = request.trace_store
+        return Result(
+            context=tuple(),
+            trace=Trace(
+                id="trace",
+                token_budget=request.token_budget,
+                input_tokens=0,
+                output_tokens=0,
+                steps=tuple(),
+            ),
+        )
+
+    monkeypatch.setattr(client._pipeline, "run", fake_run)
+
+    client.compose(FilterMessages()).apply(context=[], trace_store=trace_store)
+
+    assert captured["trace_store"] is trace_store
+
+
+def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = Tokentrim()
+    pipeline_tracer = RecordingPipelineTracer()
+    captured = {}
+
+    def fake_run(request):
+        captured["pipeline_tracer"] = request.pipeline_tracer
+        return Result(
+            context=tuple(),
+            trace=Trace(
+                id="trace",
+                token_budget=request.token_budget,
+                input_tokens=0,
+                output_tokens=0,
+                steps=tuple(),
+            ),
+        )
+
+    monkeypatch.setattr(client._pipeline, "run", fake_run)
+
+    client.compose(FilterMessages()).apply(context=[], pipeline_tracer=pipeline_tracer)
+
+    assert captured["pipeline_tracer"] is pipeline_tracer
 
 
 def test_rlm_store_belongs_to_rlm_transform() -> None:
@@ -112,6 +211,21 @@ def test_wrap_integration_delegates_to_adapter() -> None:
     assert result == "wrapped"
 
 
+def test_public_tracing_exports_use_canonical_names() -> None:
+    assert hasattr(tokentrim_module, "TokentrimTraceRecord")
+    assert hasattr(tokentrim_module, "TokentrimSpanRecord")
+    assert hasattr(tokentrim_module, "PipelineTracer")
+    assert hasattr(tokentrim_module, "PipelineSpan")
+    assert not hasattr(tokentrim_module, "IdentityTraceRecord")
+    assert not hasattr(tokentrim_module, "IdentitySpanRecord")
+    assert hasattr(tracing_module, "TokentrimTraceRecord")
+    assert hasattr(tracing_module, "TokentrimSpanRecord")
+    assert hasattr(tracing_module, "PipelineTracer")
+    assert hasattr(tracing_module, "PipelineSpan")
+    assert not hasattr(tracing_module, "IdentityTraceRecord")
+    assert not hasattr(tracing_module, "IdentitySpanRecord")
+
+
 def test_compose_apply_returns_frozen_result_objects() -> None:
     client = Tokentrim()
 
@@ -126,6 +240,49 @@ def test_compose_apply_returns_frozen_result_objects() -> None:
 
     assert isinstance(context_result, Result)
     assert isinstance(tools_result, Result)
+
+
+def test_unified_pipeline_emits_transform_span_via_pipeline_tracer() -> None:
+    client = Tokentrim()
+    pipeline_tracer = RecordingPipelineTracer()
+
+    result = client.compose(FilterMessages()).apply(
+        context=[
+            {"role": "user", "content": "keep"},
+            {"role": "assistant", "content": "   "},
+        ],
+        pipeline_tracer=pipeline_tracer,
+    )
+
+    assert [message["content"] for message in result.context] == ["keep"]
+    assert len(pipeline_tracer.spans) == 1
+    span = pipeline_tracer.spans[0]
+    assert span.name == "tokentrim.transform.filter"
+    assert span.error is None
+    assert span.data == {
+        "kind": "transform",
+        "transform_name": "filter",
+        "input_items": 2,
+        "input_tokens": result.trace.steps[0].input_tokens,
+        "output_items": 1,
+        "output_tokens": result.trace.steps[0].output_tokens,
+        "changed": True,
+    }
+
+
+def test_unified_pipeline_records_transform_span_errors() -> None:
+    client = Tokentrim()
+    pipeline_tracer = RecordingPipelineTracer()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        client.compose(ExplodingTransform()).apply(
+            context=[{"role": "user", "content": "hello"}],
+            pipeline_tracer=pipeline_tracer,
+        )
+
+    assert len(pipeline_tracer.spans) == 1
+    assert pipeline_tracer.spans[0].name == "tokentrim.transform.explode"
+    assert pipeline_tracer.spans[0].error == "RuntimeError"
 
 
 def test_compose_apply_context_wires_filter_compaction_and_rlm(

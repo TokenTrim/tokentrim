@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from tokentrim.integrations.base import IntegrationAdapter
     from tokentrim.integrations.openai_agents import OpenAIAgentsAdapter, OpenAIAgentsOptions
+    from tokentrim.tracing import PipelineTracer, TraceStore
 
 
 AdapterConfigT = TypeVar("AdapterConfigT")
@@ -50,6 +51,8 @@ class ComposedPipeline:
         session_id: str | None = None,
         task_hint: str | None = None,
         token_budget: int | None = None,
+        trace_store: TraceStore | None = None,
+        pipeline_tracer: PipelineTracer | None = None,
     ) -> Result:
         """
         Apply composed steps to the provided payload or payloads.
@@ -72,6 +75,8 @@ class ComposedPipeline:
             session_id=session_id,
             task_hint=task_hint,
             token_budget=effective_budget,
+            trace_store=trace_store,
+            pipeline_tracer=pipeline_tracer,
             steps=self._steps,
         )
         return self._pipeline.run(request)
@@ -136,6 +141,7 @@ class ComposedPipeline:
         session_id: str | None = None,
         apply_to_session_history: bool = False,
         apply_to_handoffs: bool = False,
+        trace_store: TraceStore | None = None,
         config: RunConfig | None = None,
     ) -> RunConfig:
         """
@@ -157,6 +163,7 @@ class ComposedPipeline:
                 user_id=user_id,
                 session_id=session_id,
                 token_budget=effective_budget,
+                trace_store=trace_store,
                 steps=self._steps,
                 apply_to_session_history=apply_to_session_history,
                 apply_to_handoffs=apply_to_handoffs,
@@ -210,6 +217,7 @@ class Tokentrim:
         session_id: str | None = None,
         apply_to_session_history: bool = False,
         apply_to_handoffs: bool = False,
+        trace_store: TraceStore | None = None,
         config: RunConfig | None = None,
     ) -> RunConfig:
         """
@@ -221,5 +229,6 @@ class Tokentrim:
             session_id=session_id,
             apply_to_session_history=apply_to_session_history,
             apply_to_handoffs=apply_to_handoffs,
+            trace_store=trace_store,
             config=config,
         )

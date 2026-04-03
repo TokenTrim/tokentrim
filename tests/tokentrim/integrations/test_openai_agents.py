@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -17,6 +18,8 @@ from tokentrim.integrations.openai_agents import (
     OpenAIAgentsAdapter,
     OpenAIAgentsOptions,
 )
+from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
+from tokentrim.tracing import InMemoryTraceStore
 
 
 class InMemoryStore:
@@ -80,6 +83,40 @@ def test_openai_agents_adapter_implements_integration_adapter() -> None:
 
     assert isinstance(adapter, IntegrationAdapter)
     assert isinstance(wrapped, RunConfig)
+
+
+def test_openai_agents_adapter_merges_identity_trace_metadata() -> None:
+    client = Tokentrim()
+    store = InMemoryTraceStore()
+
+    wrapped = OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(
+            user_id="u1",
+            session_id="s1",
+            trace_store=store,
+        )
+    ).wrap(
+        client,
+        config=RunConfig(trace_metadata={"team": "support"}),
+    )
+
+    assert wrapped.trace_metadata["team"] == "support"
+    namespaced = json.loads(wrapped.trace_metadata[TOKENTRIM_TRACE_METADATA_KEY])
+    assert namespaced["capture_mode"] == "identity"
+    assert namespaced["user_id"] == "u1"
+    assert namespaced["session_id"] == "s1"
+    assert isinstance(namespaced["store_id"], str)
+
+
+def test_openai_agents_adapter_requires_user_and_session_for_trace_store() -> None:
+    client = Tokentrim()
+
+    with pytest.raises(Exception) as exc_info:
+        OpenAIAgentsAdapter(
+            options=OpenAIAgentsOptions(trace_store=InMemoryTraceStore())
+        ).wrap(client)
+
+    assert "trace_store" in str(exc_info.value)
 
 
 def test_openai_agents_adapter_chains_existing_model_filter() -> None:
