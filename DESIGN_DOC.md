@@ -10,7 +10,7 @@ extension model.
 - local, in-process SDK (no hosted Tokentrim service)
 - one primary execution pattern: `compose(...).apply(...)`
 - explicit transform composition
-- inspectable runs through a stable trace model
+- inspectable runs through stable synchronous and persisted trace models
 - thin integration adapters that reuse the same core pipeline
 
 ## Public API
@@ -43,6 +43,12 @@ Additional public helpers exist on `Tokentrim`:
 - `openai_agents_config(...)` as a convenience wrapper around
   `compose(*steps).to_openai_agents(...)`
 
+Tracing-related public types live under `tokentrim/tracing/`:
+
+- `TraceStore` / `InMemoryTraceStore`
+- `TokentrimTraceRecord` / `TokentrimSpanRecord`
+- `PipelineTracer` / `PipelineSpan`
+
 ## Package Layout
 
 | Path | Responsibility |
@@ -59,6 +65,7 @@ Additional public helpers exist on `Tokentrim`:
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
 | `tokentrim/core/token_counting.py` | Token counting helpers |
 | `tokentrim/core/llm_client.py` | LiteLLM wrapper used by model-backed transforms |
+| `tokentrim/tracing/` | Canonical persisted tracing models, store implementations, and pipeline tracing interfaces |
 | `tokentrim/types/` | Shared datatypes (`Message`, `Tool`, `PipelineState`, `Trace`, `StepTrace`, `Result`) |
 | `tokentrim/integrations/base.py` | Integration adapter contract |
 | `tokentrim/integrations/openai_agents/` | OpenAI Agents adapter modules |
@@ -79,6 +86,17 @@ Every run returns one `Result`:
 - `tools: tuple[Tool, ...]`
 
 Both result payload fields are always present. Unused sides are empty tuples.
+
+Tokentrim also defines a separate persisted tracing model:
+
+- `TokentrimTraceRecord`
+- `TokentrimSpanRecord`
+- `TraceStore`
+
+This persisted model is intentionally separate from `Result.trace`. `Result.trace`
+is the synchronous pipeline trace for one `compose(...).apply(...)` call.
+Persisted trace records are integration-facing history records intended for
+cross-run lookup by `user_id + session_id`.
 
 ## Transform Contract
 
@@ -116,6 +134,35 @@ Tracing is also centralized in the pipeline. Each executed step produces one
 `StepTrace` entry with item counts, token counts, and a changed/not-changed
 flag.
 
+The pipeline may also receive a `PipelineTracer`. When present, the runtime
+opens one integration-owned span per transform step around `resolved_step.run(...)`.
+This allows integrations to attach Tokentrim transform execution to their host
+tracing systems without importing host SDKs into the core pipeline.
+
+## Tracing Model
+
+Tokentrim currently has two tracing layers:
+
+1. `Result.trace`
+   - always produced by the unified pipeline
+   - contains per-step `StepTrace` summaries
+   - intended for immediate inspection of a single Tokentrim run
+2. persisted canonical trace history
+   - stored through `TraceStore`
+   - returns `TokentrimTraceRecord` values with nested `TokentrimSpanRecord`s
+   - intended for integration history and future transform reads
+
+The canonical persisted trace model is source-agnostic:
+
+- trace records carry `source`, `capture_mode`, `source_trace_id`,
+  `user_id`, `session_id`, and raw source payload
+- span records carry `kind`, `name`, `metrics`, `data`, `parent_id`,
+  `source_span_id`, and raw source payload
+
+The default `InMemoryTraceStore` keeps active traces in-process, indexes
+completed traces by `(user_id, session_id)`, returns traces newest-first, and
+orders stored spans chronologically on read.
+
 ## Integration Boundary
 
 `IntegrationAdapter[ConfigT]` defines the integration contract:
@@ -132,11 +179,27 @@ OpenAI Agents integration is split by concern:
 - `sdk.py`: SDK compatibility utilities
 - `mappers.py`: payload mapping logic
 - `hooks.py`: integration hook wiring
+- `pipeline_tracing.py`: OpenAI-backed implementation of `PipelineTracer`
+- `translator.py`: OpenAI-to-canonical trace/span translation
+- `tracing.py`: global processor installation, metadata routing, and store persistence
 - `adapter.py`: orchestrating adapter entrypoint
 
 The current OpenAI Agents integration is still driven by message-oriented hook
 payloads. The adapter maps those into Tokentrim message inputs and ignores the
 tools side unless the caller explicitly supplies tools through another path.
+
+When `trace_store` is configured for OpenAI Agents:
+
+- the adapter requires both `user_id` and `session_id`
+- the adapter installs a process-global OpenAI tracing processor
+- reserved Tokentrim routing metadata is injected into `RunConfig.trace_metadata`
+- only traces carrying that reserved metadata are persisted
+- Tokentrim transform execution is emitted as OpenAI SDK `custom` spans and
+  translated back into canonical `kind="transform"` persisted spans
+
+This means an OpenAI-backed stored trace can contain both native SDK spans
+(`agent`, `generation`, `response`, `function`, `handoff`, and so on) and
+Tokentrim transform spans such as `filter` or `compaction`.
 
 ## Error Model
 
@@ -202,6 +265,8 @@ Integration design guidance:
 - preserve host SDK behavior when Tokentrim is effectively disabled
 - document any host-SDK limitations or payload shapes that are intentionally
   passed through unchanged
+- prefer implementing host-specific tracing through `PipelineTracer` rather than
+  importing host tracing APIs into `tokentrim/pipeline/`
 
 ## Contributor Notes
 

@@ -54,6 +54,8 @@ def trim_input_items(
         user_id=options.user_id,
         session_id=options.session_id,
         token_budget=options.token_budget,
+        trace_store=options.trace_store,
+        pipeline_tracer=options.pipeline_tracer,
     )
     return [message_to_input_item(message) for message in result.context]
 

@@ -7,6 +7,7 @@ from tokentrim.types.message import Message
 from tokentrim.types.tool import Tool
 
 if TYPE_CHECKING:
+    from tokentrim.tracing import PipelineTracer, TraceStore
     from tokentrim.transforms.base import Transform
 
 
@@ -18,6 +19,8 @@ class PipelineRequest:
     session_id: str | None = None
     task_hint: str | None = None
     token_budget: int | None = None
+    trace_store: TraceStore | None = None
+    pipeline_tracer: PipelineTracer | None = None
     steps: tuple[Transform, ...] = ()
 
 
@@ -40,6 +43,8 @@ class ContextRequest(PipelineRequest):
             session_id=session_id,
             task_hint=None,
             token_budget=token_budget,
+            trace_store=None,
+            pipeline_tracer=None,
             steps=steps,
         )
 
@@ -62,5 +67,7 @@ class ToolsRequest(PipelineRequest):
             session_id=None,
             task_hint=task_hint,
             token_budget=token_budget,
+            trace_store=None,
+            pipeline_tracer=None,
             steps=steps,
         )
