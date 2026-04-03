@@ -209,6 +209,7 @@ def test_rlm_store_belongs_to_rlm_transform(monkeypatch: pytest.MonkeyPatch) -> 
         messages,
         user_id="u1",
         session_id="s1",
+        token_budget=10,
         trace_store=trace_store,
     )
 

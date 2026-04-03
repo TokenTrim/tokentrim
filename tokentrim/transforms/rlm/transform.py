@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from types import ModuleType
 from typing import Any
 
+from tokentrim.core.token_counting import count_message_tokens
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.rlm.error import RLMConfigurationError, RLMExecutionError
@@ -24,15 +25,30 @@ class RetrieveMemory(Transform):
     trace_limit: int = 8
     max_depth: int = 1
     max_iterations: int = 4
+    tokenizer_model: str | None = None
 
     @property
     def name(self) -> str:
         return "rlm"
 
+    def resolve(
+        self,
+        *,
+        tokenizer_model: str | None = None,
+    ) -> Transform:
+        return replace(
+            self,
+            tokenizer_model=(
+                self.tokenizer_model if self.tokenizer_model is not None else tokenizer_model
+            ),
+        )
+
     def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
         if request.trace_store is None:
             return state
         if not request.user_id or not request.session_id:
+            return state
+        if request.token_budget is None:
             return state
 
         self._validate_configuration()
@@ -45,6 +61,14 @@ class RetrieveMemory(Transform):
             return state
 
         ordered_traces = list(reversed(traces))
+        trace_history = _serialize_trace_history(ordered_traces)
+        if not _should_synthesize_memory(
+            messages=state.context,
+            trace_history=trace_history,
+            token_budget=request.token_budget,
+            tokenizer_model=self.tokenizer_model,
+        ):
+            return state
         retrieval_question = _build_retrieval_question(
             messages=state.context,
             task_hint=request.task_hint,
@@ -52,7 +76,7 @@ class RetrieveMemory(Transform):
         prompt = _build_memory_prompt(
             retrieval_question=retrieval_question,
             current_messages=state.context,
-            trace_history=_serialize_trace_history(ordered_traces),
+            trace_history=trace_history,
         )
         synthesized_memory = self._generate_memory(
             prompt=prompt,
@@ -145,6 +169,21 @@ def _build_retrieval_question(*, messages: list[Message], task_hint: str | None)
 
 def _looks_like_rlm_control_output(text: str) -> bool:
     return bool(re.match(r"^\s*FINAL(?:_VAR)?\s*\(", text))
+
+
+def _should_synthesize_memory(
+    *,
+    messages: list[Message],
+    trace_history: str,
+    token_budget: int,
+    tokenizer_model: str | None,
+) -> bool:
+    projected_history = [{"role": "system", "content": trace_history}]
+    total_tokens = count_message_tokens(messages, tokenizer_model) + count_message_tokens(
+        projected_history,
+        tokenizer_model,
+    )
+    return total_tokens > token_budget
 
 
 def _build_memory_prompt(

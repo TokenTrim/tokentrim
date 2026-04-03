@@ -180,6 +180,7 @@ scoped system-memory message when relevant traces are available.
 `RetrieveMemory(model=...)` is a trace-backed memory enrichment step:
 
 - it requires `trace_store`, `user_id`, and `session_id`
+- it only runs when a `token_budget` is configured and the current live context plus serialized trace history would exceed that budget
 - it reads recent stored traces for that user/session scope
 - it builds a retrieval prompt from the current task plus live messages
 - it calls the optional external `rlm` runtime to synthesize one short memory block
@@ -188,7 +189,7 @@ scoped system-memory message when relevant traces are available.
 Important behavior:
 
 - it is context-only and does not modify tools
-- it is a no-op when scope is missing, no traces exist, or the synthesized output is blank
+- it is a no-op when scope is missing, no traces exist, no `token_budget` is set, the combined live context plus trace history already fits in budget, or the synthesized output is blank
 - it currently uses the external runtime in `environment="local"`
 - it raises a transform-specific configuration error if `tokentrim[rlm]` is not installed
 - it rejects leaked RLM scaffold output such as `FINAL(...)` / `FINAL_VAR(...)` instead of injecting it into context

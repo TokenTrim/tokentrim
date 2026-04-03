@@ -17,6 +17,7 @@ def _request(
     user_id: str | None,
     session_id: str | None,
     task_hint: str | None = None,
+    token_budget: int | None = 1,
 ) -> PipelineRequest:
     return PipelineRequest(
         messages=tuple(),
@@ -24,7 +25,7 @@ def _request(
         user_id=user_id,
         session_id=session_id,
         task_hint=task_hint,
-        token_budget=None,
+        token_budget=token_budget,
         trace_store=trace_store,
         pipeline_tracer=None,
         steps=tuple(),
@@ -137,6 +138,23 @@ def test_rlm_is_noop_without_trace_store() -> None:
     assert result.context == messages
 
 
+def test_rlm_is_noop_without_token_budget() -> None:
+    step = RetrieveMemory(model="memory-model")
+    messages = [{"role": "user", "content": "hello"}]
+
+    result = step.run(
+        PipelineState(context=messages, tools=[]),
+        _request(
+            trace_store=_seed_trace_store(1),
+            user_id="u1",
+            session_id="s1",
+            token_budget=None,
+        ),
+    )
+
+    assert result.context == messages
+
+
 @pytest.mark.parametrize(
     ("user_id", "session_id"),
     [
@@ -171,6 +189,25 @@ def test_rlm_is_noop_when_store_returns_no_traces() -> None:
     assert result.context == messages
 
 
+def test_rlm_is_noop_when_history_fits_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _install_fake_rlm(monkeypatch)
+    step = RetrieveMemory(model="memory-model")
+    messages = [{"role": "user", "content": "hello"}]
+
+    result = step.run(
+        PipelineState(context=messages, tools=[]),
+        _request(
+            trace_store=_seed_trace_store(1),
+            user_id="u1",
+            session_id="s1",
+            token_budget=10_000,
+        ),
+    )
+
+    assert result.context == messages
+    assert captured["prompt"] is None
+
+
 def test_rlm_uses_recent_bounded_history(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _install_fake_rlm(monkeypatch)
     step = RetrieveMemory(model="memory-model", trace_limit=2)
@@ -189,7 +226,7 @@ def test_rlm_uses_recent_bounded_history(monkeypatch: pytest.MonkeyPatch) -> Non
         "backend": "openai",
         "backend_kwargs": {"model_name": "memory-model"},
         "environment": "local",
-        "max_depth": 2,
+        "max_depth": 1,
         "max_iterations": 4,
         "verbose": False,
     }

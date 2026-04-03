@@ -117,6 +117,9 @@ Transform expectations:
 
 `RetrieveMemory` is a context-only transform:
 
+- it is budget-gated and only runs when the active request has a `token_budget`
+  and the current live context plus serialized trace history would exceed that
+  budget
 - it reads recent canonical trace history from `TraceStore`
 - it builds a prompt from the active task plus current live messages
 - it delegates synthesis to the optional external `rlm.RLM` runtime
@@ -124,10 +127,11 @@ Transform expectations:
 - it leaves tools unchanged
 
 Operationally, `RetrieveMemory` is a no-op when trace scope is missing, no
-stored traces exist, or synthesis returns blank output. Invalid runtime setup
-raises `RLMConfigurationError`. Unexpected runtime failures, including leaked
-RLM scaffold text such as `FINAL(...)` / `FINAL_VAR(...)`, raise
-`RLMExecutionError`.
+stored traces exist, no `token_budget` is configured, the combined live
+context plus stored trace history already fits in budget, or synthesis returns
+blank output. Invalid runtime setup raises `RLMConfigurationError`.
+Unexpected runtime failures, including leaked RLM scaffold text such as
+`FINAL(...)` / `FINAL_VAR(...)`, raise `RLMExecutionError`.
 
 ## Pipeline Runtime
 

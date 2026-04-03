@@ -220,6 +220,7 @@ def test_openai_agents_adapter_applies_rlm_to_handoff_history(
     _install_fake_rlm(monkeypatch, response="stored context")
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
+            token_budget=10,
             user_id="u1",
             session_id="s1",
             trace_store=_seed_trace_store(),
