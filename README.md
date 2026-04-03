@@ -57,6 +57,24 @@ result = tt.compose(
 optimized_messages = result.context
 ```
 
+Compaction can also target OpenAI-compatible non-OpenAI endpoints through LiteLLM:
+
+```python
+import os
+
+from tokentrim.transforms import CompactConversation
+
+
+step = CompactConversation(
+    model="openai/mercury-2",
+    keep_last=8,
+    model_options={
+        "api_base": "https://api.inceptionlabs.ai/v1",
+        "api_key": os.environ["INCEPTION_API_KEY"],
+    },
+)
+```
+
 ### Tools Only
 
 ```python
@@ -118,6 +136,10 @@ lists. For empty payloads, use `context=[]` or `tools=[]` explicitly.
 `tokenizer` is the shared model used for token counting only. Model-backed
 transforms define their own model (for example
 `CompactConversation(model=...)` and `CreateTools(model=...)`).
+
+`CompactConversation` also accepts `model_options` for provider-specific
+LiteLLM arguments such as `api_base`, `api_key`, or similar completion
+settings.
 
 ## Transform Contract
 

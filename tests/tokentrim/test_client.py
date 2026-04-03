@@ -319,8 +319,9 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
-    assert result.context[0] == {"role": "system", "content": "stored context"}
-    assert result.context[1] == {"role": "system", "content": "summary"}
+    assert result.context[0]["role"] == "system"
+    assert "stored context" in result.context[0]["content"]
+    assert "summary" in result.context[0]["content"]
     assert [trace.step_name for trace in result.trace.steps] == [
         "filter",
         "compaction",

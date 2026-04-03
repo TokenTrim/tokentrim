@@ -11,3 +11,7 @@ class CompactionConfigurationError(CompactionError):
 
 class CompactionExecutionError(CompactionError):
     """Raised when compaction generation fails unexpectedly."""
+
+
+class CompactionOutputError(CompactionError):
+    """Raised when compaction output is unsafe or structurally invalid."""

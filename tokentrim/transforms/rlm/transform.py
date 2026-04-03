@@ -33,8 +33,12 @@ class RetrieveMemory(Transform):
         if not retrieved:
             return state
 
-        injection: Message = {
-            "role": "system",
-            "content": retrieved,
-        }
+        if messages and messages[0]["role"] == "system":
+            merged: Message = {
+                "role": "system",
+                "content": f"{retrieved}\n\n{messages[0]['content']}".strip(),
+            }
+            return PipelineState(context=[merged, *messages[1:]], tools=state.tools)
+
+        injection: Message = {"role": "system", "content": retrieved}
         return PipelineState(context=[injection, *messages], tools=state.tools)

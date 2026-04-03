@@ -98,6 +98,31 @@ def test_generate_text_omits_temperature_for_gpt5_models(
     assert "temperature" not in captured
 
 
+def test_generate_text_forwards_completion_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def completion(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+
+    result = generate_text(
+        model="openai/mercury-2",
+        messages=[{"role": "user", "content": "hello"}],
+        completion_options={
+            "api_base": "https://api.inceptionlabs.ai/v1",
+            "api_key": "test-key",
+        },
+    )
+
+    assert result == "ok"
+    assert captured["api_base"] == "https://api.inceptionlabs.ai/v1"
+    assert captured["api_key"] == "test-key"
+
+
 def test_generate_text_raises_when_response_has_no_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

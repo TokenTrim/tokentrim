@@ -66,3 +66,18 @@ def test_rlm_calls_store_with_exact_identifiers() -> None:
     )
 
     assert store.calls == [("user-1", "session-1")]
+
+
+def test_rlm_merges_into_existing_system_message() -> None:
+    step = RetrieveMemory(memory_store=FakeStore("remember this"))
+    messages = [
+        {"role": "system", "content": "older summary"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(user_id="user", session_id="session"))
+
+    assert result.context == [
+        {"role": "system", "content": "remember this\n\nolder summary"},
+        {"role": "user", "content": "hello"},
+    ]

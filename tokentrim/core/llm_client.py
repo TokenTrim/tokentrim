@@ -12,6 +12,7 @@ def generate_text(
     messages: list[dict[str, str]],
     temperature: float = 0.0,
     response_format: dict[str, Any] | None = None,
+    completion_options: Mapping[str, Any] | None = None,
 ) -> str:
     try:
         from litellm import completion
@@ -29,6 +30,8 @@ def generate_text(
             completion_kwargs["response_format"] = response_format
         if not _should_omit_temperature(model=model, temperature=temperature):
             completion_kwargs["temperature"] = temperature
+        if completion_options is not None:
+            completion_kwargs.update(dict(completion_options))
 
         response = completion(**completion_kwargs)
     except Exception as exc:
