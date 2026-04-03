@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,14 +20,50 @@ from tokentrim.integrations.openai_agents import (
     OpenAIAgentsOptions,
 )
 from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
-from tokentrim.tracing import InMemoryTraceStore
+from tokentrim.tracing import InMemoryTraceStore, TokentrimTraceRecord
 
 
-class InMemoryStore:
-    def retrieve(self, *, user_id: str, session_id: str) -> str | None:
-        if user_id == "u1" and session_id == "s1":
-            return "stored context"
-        return None
+def _seed_trace_store() -> InMemoryTraceStore:
+    store = InMemoryTraceStore()
+    store.create_trace(
+        user_id="u1",
+        session_id="s1",
+        trace=TokentrimTraceRecord(
+            trace_id="openai_agents:trace_1",
+            source="openai_agents",
+            capture_mode="identity",
+            source_trace_id="trace_1",
+            user_id="u1",
+            session_id="s1",
+            workflow_name="workflow-1",
+            started_at=None,
+            ended_at=None,
+            group_id=None,
+            metadata={"topic": "support"},
+            raw_trace={"ignored": "raw"},
+        ),
+    )
+    store.complete_trace(trace_id="openai_agents:trace_1")
+    return store
+
+
+def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
+    class FakeRLM:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def completion(self, prompt, root_prompt=None):
+            del prompt
+            del root_prompt
+            return SimpleNamespace(response=response)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.rlm.transform.import_module",
+        lambda name: SimpleNamespace(RLM=FakeRLM),
+    )
 
 
 def _message_items(count: int) -> list[dict[str, str]]:
@@ -176,13 +213,17 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
     ]
 
 
-def test_openai_agents_adapter_applies_rlm_to_handoff_history() -> None:
+def test_openai_agents_adapter_applies_rlm_to_handoff_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = Tokentrim()
+    _install_fake_rlm(monkeypatch, response="stored context")
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             user_id="u1",
             session_id="s1",
-            steps=(RetrieveMemory(memory_store=InMemoryStore()),),
+            trace_store=_seed_trace_store(),
+            steps=(RetrieveMemory(model="memory-model"),),
         )
     ).wrap(client)
     payload = HandoffInputData(

@@ -59,7 +59,7 @@ Tracing-related public types live under `tokentrim/tracing/`:
 | `tokentrim/transforms/base.py` | Shared transform contract |
 | `tokentrim/transforms/filter/` | Message filtering transform |
 | `tokentrim/transforms/compaction/` | Conversation compaction transform |
-| `tokentrim/transforms/rlm/` | Retrieval-memory transform + memory store interface |
+| `tokentrim/transforms/rlm/` | TraceStore-backed memory synthesis transform using the external `rlm` runtime |
 | `tokentrim/transforms/compress_tools/` | Deterministic tool description compression |
 | `tokentrim/transforms/create_tools/` | Model-backed missing tool creation |
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
@@ -115,6 +115,20 @@ Transform expectations:
 - `resolve(...)` is the place to bind tokenizer-dependent or model-dependent
   configuration before execution
 
+`RetrieveMemory` is a context-only transform:
+
+- it reads recent canonical trace history from `TraceStore`
+- it builds a prompt from the active task plus current live messages
+- it delegates synthesis to the optional external `rlm.RLM` runtime
+- it prepends one synthesized `system` memory message when successful
+- it leaves tools unchanged
+
+Operationally, `RetrieveMemory` is a no-op when trace scope is missing, no
+stored traces exist, or synthesis returns blank output. Invalid runtime setup
+raises `RLMConfigurationError`. Unexpected runtime failures, including leaked
+RLM scaffold text such as `FINAL(...)` / `FINAL_VAR(...)`, raise
+`RLMExecutionError`.
+
 ## Pipeline Runtime
 
 `UnifiedPipeline.run(request)` executes one shared state flow:
@@ -163,6 +177,10 @@ The default `InMemoryTraceStore` keeps active traces in-process, indexes
 completed traces by `(user_id, session_id)`, returns traces newest-first, and
 orders stored spans chronologically on read.
 
+`RetrieveMemory` consumes this persisted history rather than `Result.trace`.
+It selects a bounded recent window, serializes stable canonical fields only,
+and omits raw source payloads when constructing the synthesis prompt.
+
 ## Integration Boundary
 
 `IntegrationAdapter[ConfigT]` defines the integration contract:
@@ -210,6 +228,8 @@ Examples:
 
 - shared: `TokentrimError`, `BudgetExceededError`
 - transform-local: configuration/execution/output errors where needed
+- `tokentrim/transforms/rlm/error.py`: `RLMTransformError`,
+  `RLMConfigurationError`, `RLMExecutionError`
 
 ## Testing Layout
 
@@ -268,12 +288,17 @@ Integration design guidance:
 - prefer implementing host-specific tracing through `PipelineTracer` rather than
   importing host tracing APIs into `tokentrim/pipeline/`
 
+For the current OpenAI Agents integration, `RetrieveMemory` runs unchanged on
+the core pipeline side. It only needs `trace_store`, `user_id`, and
+`session_id` so it can read persisted canonical traces for that session scope.
+
 ## Contributor Notes
 
 For local test runs, install the package in editable mode or set
 `PYTHONPATH=.` before running pytest. CI installs with:
 
 - `pip install -e ".[dev,openai-agents]"`
+- install `.[rlm]` as well when working on the recursive-memory transform
 - `PYTHONPATH=.` when running `pytest -q`
 
 For empty payload runs, prefer explicit `context=[]` or `tools=[]` when calling

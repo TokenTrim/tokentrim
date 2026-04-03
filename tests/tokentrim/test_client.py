@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 import tokentrim as tokentrim_module
@@ -11,7 +12,12 @@ from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.pipeline.requests import PipelineRequest
-from tokentrim.tracing import InMemoryTraceStore, PipelineSpan, PipelineTracer
+from tokentrim.tracing import (
+    InMemoryTraceStore,
+    PipelineSpan,
+    PipelineTracer,
+    TokentrimTraceRecord,
+)
 from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.trace import Trace
@@ -20,11 +26,47 @@ from tokentrim.transforms import FilterMessages, RetrieveMemory
 from tokentrim.transforms.base import Transform
 
 
-class InMemoryStore:
-    def retrieve(self, *, user_id: str, session_id: str) -> str | None:
-        if user_id == "u1" and session_id == "s1":
-            return "stored context"
-        return None
+def _seed_trace_store() -> InMemoryTraceStore:
+    store = InMemoryTraceStore()
+    store.create_trace(
+        user_id="u1",
+        session_id="s1",
+        trace=TokentrimTraceRecord(
+            trace_id="openai_agents:trace_1",
+            source="openai_agents",
+            capture_mode="identity",
+            source_trace_id="trace_1",
+            user_id="u1",
+            session_id="s1",
+            workflow_name="workflow-1",
+            started_at=None,
+            ended_at=None,
+            group_id=None,
+            metadata={"topic": "support"},
+            raw_trace={"ignored": "raw"},
+        ),
+    )
+    store.complete_trace(trace_id="openai_agents:trace_1")
+    return store
+
+
+def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
+    class FakeRLM:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def completion(self, prompt, root_prompt=None):
+            del prompt
+            del root_prompt
+            return SimpleNamespace(response=response)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.rlm.transform.import_module",
+        lambda name: SimpleNamespace(RLM=FakeRLM),
+    )
 
 
 class EchoAdapter(IntegrationAdapter[str]):
@@ -157,15 +199,17 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
     assert captured["pipeline_tracer"] is pipeline_tracer
 
 
-def test_rlm_store_belongs_to_rlm_transform() -> None:
-    store = InMemoryStore()
+def test_rlm_store_belongs_to_rlm_transform(monkeypatch: pytest.MonkeyPatch) -> None:
+    trace_store = _seed_trace_store()
     client = Tokentrim()
     messages = [{"role": "user", "content": "hello"}]
+    _install_fake_rlm(monkeypatch, response="stored context")
 
-    result = client.compose(RetrieveMemory(memory_store=store)).apply(
+    result = client.compose(RetrieveMemory(model="memory-model")).apply(
         messages,
         user_id="u1",
         session_id="s1",
+        trace_store=trace_store,
     )
 
     assert result.context[0] == {"role": "system", "content": "stored context"}
@@ -305,15 +349,17 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
+    _install_fake_rlm(monkeypatch, response="stored context")
     result = client.compose(
         FilterMessages(),
         CompactConversation(model="compact-model"),
-        RetrieveMemory(memory_store=InMemoryStore()),
+        RetrieveMemory(model="memory-model"),
     ).apply(
         messages,
         user_id="u1",
         session_id="s1",
         token_budget=30,
+        trace_store=_seed_trace_store(),
     )
 
     assert isinstance(result.context, tuple)

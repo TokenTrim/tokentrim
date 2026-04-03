@@ -27,10 +27,16 @@ If you plan to use the OpenAI Agents integration:
 pip install "tokentrim[openai-agents]"
 ```
 
+If you plan to use recursive memory synthesis:
+
+```bash
+pip install "tokentrim[rlm]"
+```
+
 For development:
 
 ```bash
-pip install -e ".[dev,openai-agents]"
+pip install -e ".[dev,openai-agents,rlm]"
 pre-commit install
 ```
 
@@ -39,20 +45,22 @@ pre-commit install
 ### Context Only
 
 ```python
-from tokentrim import Tokentrim
+from tokentrim import InMemoryTraceStore, Tokentrim
 from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
+trace_store = InMemoryTraceStore()
 
 result = tt.compose(
     FilterMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(),
+    RetrieveMemory(model="gpt-4o-mini"),
 ).apply(
     context=messages,
     user_id="user-123",
     session_id="session-456",
+    trace_store=trace_store,
 )
 optimized_messages = result.context
 ```
@@ -79,7 +87,7 @@ optimized_tools = result.tools
 ### Mixed Pipeline
 
 ```python
-from tokentrim import Tokentrim
+from tokentrim import InMemoryTraceStore, Tokentrim
 from tokentrim.transforms import (
     CompactConversation,
     CompressToolDescriptions,
@@ -90,11 +98,12 @@ from tokentrim.transforms import (
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
+trace_store = InMemoryTraceStore()
 
 result = tt.compose(
     FilterMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(),
+    RetrieveMemory(model="gpt-4o-mini"),
     CompressToolDescriptions(max_description_chars=160),
     CreateTools(model="gpt-4o-mini"),
 ).apply(
@@ -103,6 +112,7 @@ result = tt.compose(
     user_id="user-123",
     session_id="session-456",
     task_hint="debug a failed database connection",
+    trace_store=trace_store,
 )
 
 optimized_messages = result.context
@@ -162,6 +172,30 @@ scoped by `user_id + session_id` and include canonicalized span records for:
 - Tokentrim transform spans emitted while a wrapped OpenAI run is active
 
 Stored traces are additive. They do not replace `result.trace`.
+`RetrieveMemory(model=...)` reads this stored trace history and synthesizes one
+scoped system-memory message when relevant traces are available.
+
+## Recursive Memory
+
+`RetrieveMemory(model=...)` is a trace-backed memory enrichment step:
+
+- it requires `trace_store`, `user_id`, and `session_id`
+- it reads recent stored traces for that user/session scope
+- it builds a retrieval prompt from the current task plus live messages
+- it calls the optional external `rlm` runtime to synthesize one short memory block
+- it prepends that memory as a `system` message when synthesis succeeds
+
+Important behavior:
+
+- it is context-only and does not modify tools
+- it is a no-op when scope is missing, no traces exist, or the synthesized output is blank
+- it currently uses the external runtime in `environment="local"`
+- it raises a transform-specific configuration error if `tokentrim[rlm]` is not installed
+- it rejects leaked RLM scaffold output such as `FINAL(...)` / `FINAL_VAR(...)` instead of injecting it into context
+
+This transform is not a compaction step. It reduces stored historical trace data
+into a smaller memory block, but it usually increases the final live prompt
+because that memory is injected into the current context.
 
 ## Package Map
 
@@ -189,7 +223,7 @@ trace_store = InMemoryTraceStore()
 run_config = tt.compose(
     FilterMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(),
+    RetrieveMemory(model="gpt-4o-mini"),
 ).to_openai_agents(
     token_budget=8000,
     user_id="user-123",
@@ -224,5 +258,6 @@ such as `compaction` when those transforms run inside an active OpenAI trace.
 
 - results are frozen dataclasses
 - message and tool schemas stay intentionally minimal in v0.1
-- RLM is retrieval-only in v0.1
+- `RetrieveMemory` is TraceStore-backed memory synthesis using the optional external `rlm` runtime
+- `RetrieveMemory` enriches live context by prepending one synthesized `system` memory block
 - tool BPE is a deterministic heuristic in v0.1
