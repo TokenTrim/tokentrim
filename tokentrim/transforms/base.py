@@ -22,6 +22,12 @@ class Transform(ABC):
         del tokenizer_model
         return self
 
+    def resolve_token_budget(
+        self,
+        token_budget: int | None,
+    ) -> int | None:
+        return token_budget
+
     @abstractmethod
     def run(
         self,

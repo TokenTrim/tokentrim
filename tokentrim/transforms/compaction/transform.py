@@ -1,51 +1,231 @@
+"""Compaction transform for summarizing conversation history.
+
+This module provides the CompactConversation transform which compresses older
+messages into a concise summary when the context exceeds a token budget.
+The summary is injected as a system message, preserving recent messages.
+"""
+
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Final
 
 from tokentrim.core.llm_client import generate_text
 from tokentrim.core.token_counting import count_message_tokens
+from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.transforms.base import Transform
+from tokentrim.transforms.compaction.microcompact import (
+    MicrocompactConfig,
+    MicrocompactOrchestrator,
+)
 from tokentrim.transforms.compaction.error import (
     CompactionConfigurationError,
     CompactionExecutionError,
     CompactionOutputError,
 )
-from tokentrim.pipeline.requests import PipelineRequest
-from tokentrim.transforms.base import Transform
 from tokentrim.types.message import Message
 from tokentrim.types.state import PipelineState
 
-_ABSOLUTE_PATH_PATTERN = re.compile(r"(?:^|[\s(])((?:~|/)[^\s:;,)\]]+)")
-_RELATIVE_PATH_PATTERN = re.compile(r"(?:^|[\s(])((?:\.\.?/)[^\s:;,)\]]+)")
-_BACKTICK_PATTERN = re.compile(r"`([^`\n]+)`")
-_COMMAND_LINE_PATTERN = re.compile(r"(?m)^(?:\$|#)?\s*([a-zA-Z0-9_.:/-]+(?:\s+[^\n]+)?)$")
-_ERROR_LINE_PATTERN = re.compile(
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Configuration Constants
+# =============================================================================
+
+# Default number of recent messages to preserve without summarization.
+DEFAULT_KEEP_LAST: Final[int] = 6
+
+# Default amount of room to reserve for the model response.
+DEFAULT_RESERVED_OUTPUT_TOKENS: Final[int] = 8_000
+
+# Start compacting before the context window is actually full.
+DEFAULT_AUTO_COMPACT_BUFFER_TOKENS: Final[int] = 4_000
+
+# Maximum number of artifacts (paths, commands, errors) to preserve in summary.
+MAX_PRESERVED_ARTIFACTS: Final[int] = 6
+
+# Character limit for truncated content in fallback summaries.
+FALLBACK_TRUNCATION_LIMIT: Final[int] = 120
+
+# Summaries exceeding this length with transcript patterns are flagged as uncompacted.
+UNCOMPACTED_TRANSCRIPT_THRESHOLD: Final[int] = 2_500
+
+# Prefix for summary system messages, marking them as historical context.
+SUMMARY_SYSTEM_PREFIX: Final[str] = "History only."
+
+
+# =============================================================================
+# Artifact Extraction Patterns
+# =============================================================================
+
+# Matches absolute paths: /usr/bin/python, ~/Documents/file.txt
+_ABSOLUTE_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|[\s(])((?:~|/)[^\s:;,)\]]+)"
+)
+
+# Matches relative paths: ./src/main.py, ../config.yaml
+_RELATIVE_PATH_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:^|[\s(])((?:\.\.?/)[^\s:;,)\]]+)"
+)
+
+# Matches inline code spans: `variable_name`, `some_command`
+_BACKTICK_CODE_RE: Final[re.Pattern[str]] = re.compile(r"`([^`\n]+)`")
+
+# Matches shell command line prefixes: $ git status, # pip install
+_SHELL_COMMAND_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?m)^(?:\$|#)?\s*([a-zA-Z0-9_.:/-]+(?:\s+[^\n]+)?)$"
+)
+
+# Matches error/exception lines (case-insensitive)
+_ERROR_LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?im)^.*(?:error|exception|traceback|failed|failure|enoent|permission denied).*$"
 )
-_WHITESPACE_PATTERN = re.compile(r"\s+")
-_SUMMARY_PREFIX = "History only."
 
+# Whitespace normalization pattern
+_WHITESPACE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
+
+# Known command prefixes for shell command detection
+_KNOWN_COMMAND_PREFIXES: Final[frozenset[str]] = frozenset(
+    ("git", "python", "python3", "pytest", "uv", "pip", "npm", "cargo", "bash", "sh")
+)
+
+_MODEL_CONTEXT_WINDOW_PATTERNS: Final[tuple[tuple[str, int], ...]] = (
+    ("gpt-4.1", 1_000_000),
+    ("o4-mini", 200_000),
+    ("o3", 200_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 128_000),
+    ("claude", 200_000),
+    ("mercury-2", 200_000),
+)
+
+
+# =============================================================================
+# Prompt Configuration
+# =============================================================================
 
 @dataclass(frozen=True, slots=True)
-class _PromptFamily:
+class PromptTemplate:
+    """Configuration for a summarization prompt style.
+
+    Attributes:
+        name: Identifier for this prompt style (e.g., "technical", "checkpoint").
+        system_prompt: System message instructing the LLM how to summarize.
+        user_template: User message template with {history} and {required_artifacts}.
+    """
+
     name: str
-    system: str
+    system_prompt: str
     user_template: str
+
+
+# Available summarization prompt styles, keyed by name
+_PROMPT_TEMPLATES: Final[dict[str, PromptTemplate]] = {
+    "structured": PromptTemplate(
+        name="structured",
+        system_prompt=(
+            "Summarise the conversation into a compact engineering handoff. "
+            "Return plaintext only. Keep exact technical details when they matter."
+        ),
+        user_template=(
+            "Write a concise handoff using these exact headings:\n"
+            "Goal:\n"
+            "Current State:\n"
+            "Important Facts:\n"
+            "Commands / Paths / Identifiers:\n"
+            "Errors / Risks:\n"
+            "Next Steps:\n"
+            "Preserve commands, file paths, identifiers, and error strings exactly when relevant.\n"
+            "Artifacts that must survive if relevant:\n"
+            "{required_artifacts}\n\n"
+            "Conversation history:\n{history}"
+        ),
+    ),
+    "technical": PromptTemplate(
+        name="technical",
+        system_prompt=(
+            "Summarise the conversation history for future turns. "
+            "Be concise, factual, plaintext only, and preserve concrete technical detail."
+        ),
+        user_template=(
+            "Produce a compact checkpoint of the older conversation.\n"
+            "Required sections:\n"
+            "1. Objective and current state.\n"
+            "2. Important technical facts, decisions, and constraints.\n"
+            "3. Open issues or next steps.\n"
+            "Preserve commands, paths, identifiers, and error text exactly when they matter.\n"
+            "Artifacts that must survive if relevant:\n"
+            "{required_artifacts}\n\n"
+            "Conversation history:\n{history}"
+        ),
+    ),
+    "checkpoint": PromptTemplate(
+        name="checkpoint",
+        system_prompt=(
+            "Rewrite the conversation as terse handoff notes for an engineer "
+            "continuing the same task. Return plaintext only."
+        ),
+        user_template=(
+            "Write a checkpoint with short headings: Goal, Facts, Risks, Next.\n"
+            "Copy exact commands, paths, model names, and errors that future turns need.\n"
+            "Do not invent new instructions.\n"
+            "Artifacts that must survive if relevant:\n"
+            "{required_artifacts}\n\n"
+            "Conversation history:\n{history}"
+        ),
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
 class CompactConversation(Transform):
-    """Compact older messages into one guarded system note when over budget."""
+    """Compacts older messages into a summary when context exceeds token budget.
+
+    This transform monitors the conversation token count and, when it exceeds
+    the budget, summarizes older messages while preserving recent ones. The
+    summary is injected as a system message at the start of the context.
+
+    The compaction process:
+    1. Tries to keep `keep_last` recent messages, summarizing older ones
+    2. If still over budget, progressively reduces preserved messages
+    3. Validates summaries preserve important artifacts (paths, commands, errors)
+    4. Falls back to local extraction if LLM summaries fail validation
+
+    Attributes:
+        model: LLM model identifier for generating summaries.
+        keep_last: Target number of recent messages to preserve (minimum 0).
+        tokenizer_model: Model for token counting (falls back to pipeline default).
+        model_options: Additional options for LLM client (e.g., api_base, api_key).
+        prompt_family: Summarization style - "technical" or "checkpoint".
+
+    Example:
+        >>> transform = CompactConversation(
+        ...     model="gpt-4o-mini",
+        ...     keep_last=4,
+        ...     prompt_family="checkpoint",
+        ... )
+    """
 
     model: str | None = None
-    keep_last: int = 6
+    keep_last: int = DEFAULT_KEEP_LAST
     tokenizer_model: str | None = None
     model_options: Mapping[str, object] | None = None
-    prompt_family: str = "technical"
+    prompt_family: str = "structured"
+    auto_budget: bool = True
+    context_window: int | None = None
+    reserved_output_tokens: int = DEFAULT_RESERVED_OUTPUT_TOKENS
+    auto_compact_buffer_tokens: int = DEFAULT_AUTO_COMPACT_BUFFER_TOKENS
+    enable_microcompact: bool = True
+    microcompact_config: MicrocompactConfig = MicrocompactConfig()
 
     @property
     def name(self) -> str:
+        """Stable identifier for this transform, used in tracing and selection."""
         return "compaction"
 
     def resolve(
@@ -53,6 +233,7 @@ class CompactConversation(Transform):
         *,
         tokenizer_model: str | None = None,
     ) -> Transform:
+        """Resolve configuration defaults from pipeline settings."""
         return replace(
             self,
             tokenizer_model=(
@@ -60,89 +241,209 @@ class CompactConversation(Transform):
             ),
         )
 
+    def resolve_token_budget(
+        self,
+        token_budget: int | None,
+    ) -> int | None:
+        return self._resolve_effective_token_budget(token_budget)
+
     def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        """Execute compaction on the pipeline state.
+
+        Args:
+            state: Current pipeline state with context messages and tools.
+            request: Pipeline request containing token budget.
+
+        Returns:
+            Updated state, potentially with compacted context.
+
+        Raises:
+            CompactionConfigurationError: If keep_last < 0 or model missing.
+            CompactionOutputError: If all summarization attempts fail validation.
+        """
         messages = state.context
+
         if self.keep_last < 0:
-            raise CompactionConfigurationError("Compaction keep_last must be at least 0.")
-        if request.token_budget is None:
+            raise CompactionConfigurationError(
+                f"keep_last must be >= 0, got {self.keep_last}"
+            )
+
+        effective_budget = self._resolve_effective_token_budget(request.token_budget)
+
+        if not self._requires_compaction(messages, effective_budget):
             return state
-        if len(messages) <= self.keep_last:
-            return state
-        if count_message_tokens(messages, self.tokenizer_model) <= request.token_budget:
-            return state
+
         if not self.model:
             raise CompactionConfigurationError(
                 "Compaction is enabled but no compaction model is configured."
             )
 
-        for keep_count in range(self.keep_last, -1, -1):
-            to_compact = messages[:-keep_count] if keep_count else messages
-            recent = messages[-keep_count:] if keep_count else []
-            summary = self._compress(to_compact)
-            candidate_context = [{"role": "system", "content": self._wrap_summary(summary)}, *recent]
-            if count_message_tokens(candidate_context, self.tokenizer_model) <= request.token_budget:
-                return PipelineState(context=candidate_context, tools=state.tools)
+        return self._compact_with_budget_fit(messages, effective_budget, state.tools)
 
-        summary = self._compress(messages)
+    # -------------------------------------------------------------------------
+    # Compaction Strategy
+    # -------------------------------------------------------------------------
+
+    def _requires_compaction(
+        self,
+        messages: Sequence[Message],
+        token_budget: int | None,
+    ) -> bool:
+        """Check if compaction is needed based on budget and message count."""
+        if token_budget is None:
+            return False
+        if len(messages) <= self.keep_last:
+            return False
+        current_tokens = count_message_tokens(messages, self.tokenizer_model)
+        return current_tokens > token_budget
+
+    def _resolve_effective_token_budget(self, explicit_budget: int | None) -> int | None:
+        if explicit_budget is not None:
+            return explicit_budget
+        if not self.auto_budget:
+            return None
+
+        effective_context_window = self._resolve_effective_context_window()
+        if effective_context_window is None:
+            return None
+        return max(1, effective_context_window - self.auto_compact_buffer_tokens)
+
+    def _resolve_effective_context_window(self) -> int | None:
+        context_window = self.context_window
+        if context_window is None:
+            context_window = self._infer_context_window_from_model()
+        if context_window is None:
+            return None
+        reserved_output_tokens = min(self.reserved_output_tokens, context_window - 1)
+        return max(1, context_window - reserved_output_tokens)
+
+    def _infer_context_window_from_model(self) -> int | None:
+        candidates = [self.model, self.tokenizer_model]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            normalized = candidate.lower()
+            for pattern, context_window in _MODEL_CONTEXT_WINDOW_PATTERNS:
+                if pattern in normalized:
+                    return context_window
+        return None
+
+    def _compact_with_budget_fit(
+        self,
+        messages: Sequence[Message],
+        token_budget: int,
+        tools: Sequence[object],
+    ) -> PipelineState:
+        """Try progressively aggressive compaction until context fits budget.
+
+        Starts by preserving keep_last messages, then reduces if needed.
+        """
+        for preserved_count in range(self.keep_last, -1, -1):
+            messages_to_summarize = messages[:-preserved_count] if preserved_count else messages
+            preserved_messages = messages[-preserved_count:] if preserved_count else []
+
+            logger.debug(
+                "Attempting compaction: summarizing %d messages, preserving %d",
+                len(messages_to_summarize),
+                len(preserved_messages),
+            )
+
+            summary = self._generate_validated_summary(messages_to_summarize)
+            summary_message = self._create_summary_message(summary)
+            candidate_context = [summary_message, *preserved_messages]
+
+            if count_message_tokens(candidate_context, self.tokenizer_model) <= token_budget:
+                logger.info(
+                    "Compaction successful: %d messages → summary + %d preserved",
+                    len(messages),
+                    len(preserved_messages),
+                )
+                return PipelineState(context=candidate_context, tools=tools)
+
+        # Final attempt: summarize everything
+        summary = self._generate_validated_summary(messages)
         return PipelineState(
-            context=[{"role": "system", "content": self._wrap_summary(summary)}],
-            tools=state.tools,
+            context=[self._create_summary_message(summary)],
+            tools=tools,
         )
 
-    def _compress(self, messages: list[Message]) -> str:
-        artifact_hints = self._extract_artifact_hints(messages)
-        failures: list[str] = []
+    # -------------------------------------------------------------------------
+    # Summary Generation & Validation
+    # -------------------------------------------------------------------------
 
-        for family in self._prompt_attempts():
-            raw_summary = self._generate_summary(
-                messages=messages,
-                family=family,
-                artifact_hints=artifact_hints,
+    def _generate_validated_summary(self, messages: Sequence[Message]) -> str:
+        """Generate and validate a summary, with fallback on failure.
+
+        Tries each prompt template in order, falling back to local extraction
+        if all LLM-generated summaries fail validation.
+
+        Raises:
+            CompactionOutputError: If all attempts (including fallback) fail.
+        """
+        microcompacted_messages = self._apply_microcompact(messages, pressure="high")
+        preserved_artifacts = self._extract_preserved_artifacts(microcompacted_messages)
+        validation_failures: list[str] = []
+
+        # Try each prompt template
+        for template in self._get_ordered_templates():
+            raw_summary = self._call_llm_for_summary(
+                microcompacted_messages,
+                template,
+                preserved_artifacts,
             )
-            summary = self._normalize_summary(raw_summary)
+            summary = self._normalize_whitespace(raw_summary)
+
             problems = self._validate_summary(
-                messages=messages,
-                summary=summary,
-                artifact_hints=artifact_hints,
+                microcompacted_messages,
+                summary,
+                preserved_artifacts,
             )
             if not problems:
                 return summary
-            failures.append(f"{family.name}: {', '.join(problems)}")
 
-        fallback = self._build_fallback_summary(messages=messages, artifact_hints=artifact_hints)
+            validation_failures.append(f"{template.name}: {', '.join(problems)}")
+            logger.debug("Summary from '%s' failed validation: %s", template.name, problems)
+
+        # Try local fallback extraction
+        fallback = self._build_fallback_summary(microcompacted_messages, preserved_artifacts)
         fallback_problems = self._validate_summary(
-            messages=messages,
-            summary=fallback,
-            artifact_hints=artifact_hints,
+            microcompacted_messages,
+            fallback,
+            preserved_artifacts,
             require_shorter=False,
         )
         if not fallback_problems:
+            logger.info("Using fallback summary after LLM validation failures")
             return fallback
 
-        failure_text = "; ".join([*failures, f"fallback: {', '.join(fallback_problems)}"])
-        raise CompactionOutputError(
-            f"Compaction output failed validation: {failure_text}"
+        validation_failures.append(f"fallback: {', '.join(fallback_problems)}")
+        failure_details = "; ".join(validation_failures)
+        raise CompactionOutputError(f"Compaction output failed validation: {failure_details}")
+
+    def _call_llm_for_summary(
+        self,
+        messages: Sequence[Message],
+        template: PromptTemplate,
+        preserved_artifacts: Sequence[str],
+    ) -> str:
+        """Call the LLM to generate a summary using the given template."""
+        formatted_history = self._format_messages_as_history(messages)
+        artifacts_text = (
+            "\n".join(f"- {artifact}" for artifact in preserved_artifacts)
+            or "- none"
         )
 
-    def _generate_summary(
-        self,
-        *,
-        messages: list[Message],
-        family: _PromptFamily,
-        artifact_hints: Sequence[str],
-    ) -> str:
-        history = self._format_history(messages)
-        required_artifacts = "\n".join(f"- {artifact}" for artifact in artifact_hints) or "- none"
-        prompt = [
-            {"role": "system", "content": family.system},
+        prompt: list[Message] = [
+            {"role": "system", "content": template.system_prompt},
             {
                 "role": "user",
-                "content": family.user_template.format(
-                    history=history,
-                    required_artifacts=required_artifacts,
+                "content": template.user_template.format(
+                    history=formatted_history,
+                    required_artifacts=artifacts_text,
                 ),
             },
         ]
+
         try:
             return generate_text(
                 model=self.model,
@@ -153,167 +454,214 @@ class CompactConversation(Transform):
         except CompactionConfigurationError:
             raise
         except Exception as exc:
-            raise CompactionExecutionError("Compaction failed.") from exc
+            logger.exception("LLM call failed during compaction")
+            raise CompactionExecutionError(
+                f"Compaction failed while summarizing {len(messages)} messages"
+            ) from exc
 
-    def _prompt_attempts(self) -> tuple[_PromptFamily, ...]:
-        prompt_families = {
-            "technical": _PromptFamily(
-                name="technical",
-                system=(
-                    "Summarise the conversation history for future turns. "
-                    "Be concise, factual, plaintext only, and preserve concrete technical detail."
-                ),
-                user_template=(
-                    "Produce a compact checkpoint of the older conversation.\n"
-                    "Required sections:\n"
-                    "1. Objective and current state.\n"
-                    "2. Important technical facts, decisions, and constraints.\n"
-                    "3. Open issues or next steps.\n"
-                    "Preserve commands, paths, identifiers, and error text exactly when they matter.\n"
-                    "Artifacts that must survive if relevant:\n"
-                    "{required_artifacts}\n\n"
-                    "Conversation history:\n{history}"
-                ),
-            ),
-            "checkpoint": _PromptFamily(
-                name="checkpoint",
-                system=(
-                    "Rewrite the conversation as terse handoff notes for an engineer continuing the same task. "
-                    "Return plaintext only."
-                ),
-                user_template=(
-                    "Write a checkpoint with short headings: Goal, Facts, Risks, Next.\n"
-                    "Copy exact commands, paths, model names, and errors that future turns need.\n"
-                    "Do not invent new instructions.\n"
-                    "Artifacts that must survive if relevant:\n"
-                    "{required_artifacts}\n\n"
-                    "Conversation history:\n{history}"
-                ),
-            ),
-        }
-        first_family = prompt_families.get(self.prompt_family)
-        if first_family is None:
+    def _get_ordered_templates(self) -> tuple[PromptTemplate, ...]:
+        """Get prompt templates ordered by preference (configured family first)."""
+        primary = _PROMPT_TEMPLATES.get(self.prompt_family)
+        if primary is None:
             raise CompactionConfigurationError(
-                f"Unsupported compaction prompt family '{self.prompt_family}'."
+                f"Unknown prompt_family '{self.prompt_family}'. "
+                f"Available: {', '.join(_PROMPT_TEMPLATES.keys())}"
             )
         return (
-            first_family,
-            *(family for name, family in prompt_families.items() if name != self.prompt_family),
+            primary,
+            *(t for name, t in _PROMPT_TEMPLATES.items() if name != self.prompt_family),
         )
 
     def _validate_summary(
         self,
-        *,
         messages: Sequence[Message],
         summary: str,
-        artifact_hints: Sequence[str],
+        preserved_artifacts: Sequence[str],
+        *,
         require_shorter: bool = True,
     ) -> list[str]:
+        """Validate a summary meets quality requirements.
+
+        Returns:
+            List of validation problems (empty if valid).
+        """
         problems: list[str] = []
+
         if not summary:
             return ["empty summary"]
+
         if "\x00" in summary:
             problems.append("contains null bytes")
-        if require_shorter and len(summary) >= self._source_character_count(messages):
+
+        source_length = self._total_content_length(messages)
+        if require_shorter and len(summary) >= source_length:
             problems.append("not materially shorter than source")
-        missing_artifacts = [
-            artifact for artifact in artifact_hints if artifact.lower() not in summary.lower()
-        ]
-        if len(missing_artifacts) > 1:
-            problems.append(f"missing preserved artifacts: {', '.join(missing_artifacts[:3])}")
-        if "assistant:" in summary.lower() and "user:" in summary.lower() and len(summary) > 2_500:
-            problems.append("looks like an uncompact transcript dump")
+
+        # Check that most artifacts are preserved (allow 1 missing)
+        missing = [a for a in preserved_artifacts if a.lower() not in summary.lower()]
+        if len(missing) > 1:
+            problems.append(f"missing artifacts: {', '.join(missing[:3])}")
+
+        # Detect uncompacted transcript dumps
+        if self._looks_like_transcript_dump(summary):
+            problems.append("appears to be uncompacted transcript")
+
         return problems
+
+    def _looks_like_transcript_dump(self, summary: str) -> bool:
+        """Detect if summary is just a copy of the conversation."""
+        has_role_markers = "assistant:" in summary.lower() and "user:" in summary.lower()
+        return has_role_markers and len(summary) > UNCOMPACTED_TRANSCRIPT_THRESHOLD
 
     def _build_fallback_summary(
         self,
-        *,
         messages: Sequence[Message],
-        artifact_hints: Sequence[str],
+        preserved_artifacts: Sequence[str],
     ) -> str:
-        sections = [
-            "Checkpoint: "
-            + " | ".join(self._fallback_turn_notes(messages))
-        ]
-        if artifact_hints:
-            sections.append("Preserve exactly: " + " | ".join(artifact_hints))
-        return "\n".join(section for section in sections if section).strip()
+        """Build a simple summary from recent messages when LLM fails."""
+        sections: list[str] = []
 
-    def _fallback_turn_notes(self, messages: Sequence[Message]) -> list[str]:
+        # Include notes from last 2 messages
+        turn_notes = self._extract_recent_turn_notes(messages)
+        sections.append("Checkpoint: " + " | ".join(turn_notes))
+
+        if preserved_artifacts:
+            sections.append("Preserve exactly: " + " | ".join(preserved_artifacts))
+
+        return "\n".join(sections).strip()
+
+    def _extract_recent_turn_notes(self, messages: Sequence[Message]) -> list[str]:
+        """Extract brief notes from the last 2 messages for fallback summary."""
         notes: list[str] = []
         for message in messages[-2:]:
             role = message["role"]
-            content = self._clip(self._normalize_summary(message["content"]), limit=120)
-            if not content:
-                continue
-            notes.append(f"{role}: {content}")
+            content = self._truncate_with_ellipsis(
+                self._normalize_whitespace(message["content"]),
+                limit=FALLBACK_TRUNCATION_LIMIT,
+            )
+            if content:
+                notes.append(f"{role}: {content}")
         return notes or ["Prior turns contained no compactable content."]
 
-    def _extract_artifact_hints(self, messages: Sequence[Message]) -> tuple[str, ...]:
+    # -------------------------------------------------------------------------
+    # Deterministic Microcompact
+    # -------------------------------------------------------------------------
+
+    def _apply_microcompact(
+        self,
+        messages: Sequence[Message],
+        *,
+        pressure: str | None = None,
+    ) -> list[Message]:
+        """Deterministically compress older messages before LLM summarization."""
+        if not self.enable_microcompact:
+            return list(messages)
+        orchestrator = MicrocompactOrchestrator(
+            config=self.microcompact_config,
+            tokenizer_model=self.tokenizer_model,
+        )
+        return orchestrator.apply(list(messages), pressure=pressure)
+
+    # -------------------------------------------------------------------------
+    # Artifact Extraction
+    # -------------------------------------------------------------------------
+
+    def _extract_preserved_artifacts(
+        self,
+        messages: Sequence[Message],
+    ) -> tuple[str, ...]:
+        """Extract important artifacts (paths, commands, errors) from messages.
+
+        These are passed to the LLM as hints for what to preserve in the summary.
+        """
         artifacts: list[str] = []
         for message in messages:
-            artifacts.extend(self._extract_message_artifacts(message["content"]))
+            artifacts.extend(self._extract_artifacts_from_content(message["content"]))
 
-        deduped: list[str] = []
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
         for artifact in artifacts:
             normalized = artifact.strip()
-            if not normalized or normalized in deduped:
-                continue
-            deduped.append(normalized)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                unique.append(normalized)
 
-        return tuple(deduped[:6])
+        return tuple(unique[:MAX_PRESERVED_ARTIFACTS])
 
-    def _extract_message_artifacts(self, content: str) -> list[str]:
+    def _extract_artifacts_from_content(self, content: str) -> list[str]:
+        """Extract artifact strings from message content."""
         artifacts: list[str] = []
-        artifacts.extend(match.group(1) for match in _ABSOLUTE_PATH_PATTERN.finditer(content))
-        artifacts.extend(match.group(1) for match in _RELATIVE_PATH_PATTERN.finditer(content))
-        artifacts.extend(self._clean_artifact(match.group(1)) for match in _BACKTICK_PATTERN.finditer(content))
+
+        # File paths
+        artifacts.extend(m.group(1) for m in _ABSOLUTE_PATH_RE.finditer(content))
+        artifacts.extend(m.group(1) for m in _RELATIVE_PATH_RE.finditer(content))
+
+        # Inline code
         artifacts.extend(
-            self._clean_artifact(match.group(0).strip())
-            for match in _ERROR_LINE_PATTERN.finditer(content)
+            self._strip_punctuation(m.group(1))
+            for m in _BACKTICK_CODE_RE.finditer(content)
         )
 
+        # Error lines
+        artifacts.extend(
+            self._strip_punctuation(m.group(0).strip())
+            for m in _ERROR_LINE_RE.finditer(content)
+        )
+
+        # Shell commands
         for line in content.splitlines():
             stripped = line.strip()
-            if not stripped:
-                continue
             if stripped.startswith("$ "):
-                artifacts.append(self._clean_artifact(stripped[2:]))
-                continue
-            if self._looks_like_command(stripped):
-                artifacts.append(self._clean_artifact(stripped))
+                artifacts.append(self._strip_punctuation(stripped[2:]))
+            elif self._is_shell_command(stripped):
+                artifacts.append(self._strip_punctuation(stripped))
 
-        return [artifact for artifact in artifacts if artifact]
+        return [a for a in artifacts if a]
 
-    def _looks_like_command(self, line: str) -> bool:
-        match = _COMMAND_LINE_PATTERN.match(line)
-        if match is None:
+    def _is_shell_command(self, line: str) -> bool:
+        """Check if a line looks like a shell command."""
+        match = _SHELL_COMMAND_RE.match(line)
+        if not match:
             return False
-        head = match.group(1).split()[0]
+        first_word = match.group(1).split()[0]
         return any(
-            head == prefix or head.startswith(f"{prefix}/")
-            for prefix in ("git", "python", "python3", "pytest", "uv", "pip", "npm", "cargo", "bash", "sh")
+            first_word == prefix or first_word.startswith(f"{prefix}/")
+            for prefix in _KNOWN_COMMAND_PREFIXES
         )
 
-    def _format_history(self, messages: Sequence[Message]) -> str:
+    # -------------------------------------------------------------------------
+    # Formatting Helpers
+    # -------------------------------------------------------------------------
+
+    def _format_messages_as_history(self, messages: Sequence[Message]) -> str:
+        """Format messages as numbered history for summarization prompt."""
         return "\n\n".join(
-            f"[{index}] role={message['role']}\n{message['content']}"
-            for index, message in enumerate(messages, start=1)
+            f"[{i}] role={msg['role']}\n{msg['content']}"
+            for i, msg in enumerate(messages, start=1)
         )
 
-    def _source_character_count(self, messages: Sequence[Message]) -> int:
-        return sum(len(message["content"]) for message in messages)
+    def _create_summary_message(self, summary: str) -> Message:
+        """Wrap summary in a system message with the history prefix."""
+        return {
+            "role": "system",
+            "content": f"{SUMMARY_SYSTEM_PREFIX}\n\n{summary}".strip(),
+        }
 
-    def _wrap_summary(self, summary: str) -> str:
-        return f"{_SUMMARY_PREFIX}\n\n{summary}".strip()
+    def _total_content_length(self, messages: Sequence[Message]) -> int:
+        """Calculate total character count of message contents."""
+        return sum(len(msg["content"]) for msg in messages)
 
-    def _normalize_summary(self, summary: str) -> str:
-        return _WHITESPACE_PATTERN.sub(" ", summary).strip()
+    def _normalize_whitespace(self, text: str) -> str:
+        """Collapse consecutive whitespace and trim."""
+        return _WHITESPACE_RE.sub(" ", text).strip()
 
-    def _clip(self, text: str, *, limit: int) -> str:
+    def _truncate_with_ellipsis(self, text: str, *, limit: int) -> str:
+        """Truncate text with ellipsis if it exceeds the limit."""
         if len(text) <= limit:
             return text
-        return f"{text[: limit - 3].rstrip()}..."
+        return f"{text[:limit - 3].rstrip()}..."
 
-    def _clean_artifact(self, artifact: str) -> str:
-        return artifact.strip().strip("()[]{}.,:;")
+    def _strip_punctuation(self, text: str) -> str:
+        """Remove surrounding punctuation from artifact strings."""
+        return text.strip().strip("()[]{}.,:;")

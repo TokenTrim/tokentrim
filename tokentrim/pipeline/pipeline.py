@@ -46,6 +46,22 @@ class UnifiedPipeline:
         *,
         request: PipelineRequest,
     ) -> tuple[Trace, tuple[Any, ...], tuple[Any, ...]]:
+        resolved_steps = self._resolve_steps(request.steps)
+        effective_budget = self._resolve_token_budget(
+            request.token_budget,
+            resolved_steps=resolved_steps,
+        )
+        request = PipelineRequest(
+            messages=request.messages,
+            tools=request.tools,
+            user_id=request.user_id,
+            session_id=request.session_id,
+            task_hint=request.task_hint,
+            token_budget=effective_budget,
+            trace_store=request.trace_store,
+            pipeline_tracer=request.pipeline_tracer,
+            steps=resolved_steps,
+        )
         step_traces: list[StepTrace] = []
         state = PipelineState(
             context=clone_messages(request.messages),
@@ -58,7 +74,7 @@ class UnifiedPipeline:
             if not isinstance(step, Transform):
                 raise TokentrimError("Pipeline steps must be transforms.")
 
-            resolved_step = step.resolve(tokenizer_model=self._tokenizer_model)
+            resolved_step = step
             before_state = PipelineState(
                 context=clone_messages(state.context),
                 tools=clone_tools(state.tools),
@@ -119,6 +135,25 @@ class UnifiedPipeline:
             freeze_messages(state.context),
             freeze_tools(state.tools),
         )
+
+    def _resolve_steps(self, steps: tuple[Transform, ...]) -> tuple[Transform, ...]:
+        resolved_steps: list[Transform] = []
+        for step in steps:
+            if not isinstance(step, Transform):
+                raise TokentrimError("Pipeline steps must be transforms.")
+            resolved_steps.append(step.resolve(tokenizer_model=self._tokenizer_model))
+        return tuple(resolved_steps)
+
+    def _resolve_token_budget(
+        self,
+        token_budget: int | None,
+        *,
+        resolved_steps: tuple[Transform, ...],
+    ) -> int | None:
+        effective_budget = token_budget
+        for step in resolved_steps:
+            effective_budget = step.resolve_token_budget(effective_budget)
+        return effective_budget
 
     def _count_total_tokens(self, state: PipelineState) -> int:
         return count_message_tokens(state.context, self._tokenizer_model) + count_tool_tokens(

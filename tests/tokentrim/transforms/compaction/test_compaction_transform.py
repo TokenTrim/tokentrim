@@ -32,7 +32,7 @@ def test_compaction_is_noop_when_under_budget() -> None:
 
 
 def test_compaction_is_noop_when_budget_is_none() -> None:
-    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    step = CompactConversation(model="compact-model", tokenizer_model=None, auto_budget=False)
     messages = _messages(8)
 
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=None))
@@ -112,6 +112,135 @@ def test_compaction_only_sends_older_messages_to_summarizer(
     assert "message 9" not in prompt[1]["content"]
 
 
+def test_compaction_uses_structured_prompt_family_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = _messages(10)
+    captured = {}
+
+    def fake_generate_text(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return (
+            "Goal: keep debugging.\n"
+            "Current State: in progress.\n"
+            "Important Facts: preserved.\n"
+            "Commands / Paths / Identifiers: none.\n"
+            "Errors / Risks: none.\n"
+            "Next Steps: continue."
+        )
+
+    monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+
+    step.run(PipelineState(context=messages, tools=[]), _request(token_budget=101))
+
+    prompt = captured["messages"]
+    assert "compact engineering handoff" in prompt[0]["content"]
+    assert "Goal:" in prompt[1]["content"]
+    assert "Current State:" in prompt[1]["content"]
+    assert "Next Steps:" in prompt[1]["content"]
+
+
+def test_compaction_can_trigger_automatically_from_known_model_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(
+        model="gpt-4o-mini",
+        tokenizer_model=None,
+        context_window=220,
+        reserved_output_tokens=50,
+        auto_compact_buffer_tokens=50,
+    )
+    messages = _messages(10)
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=None))
+
+    assert result.context[0]["role"] == "system"
+    assert result.context[0]["content"].endswith("summary")
+
+
+def test_explicit_token_budget_overrides_auto_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactConversation(
+        model="gpt-4o-mini",
+        tokenizer_model=None,
+        context_window=600,
+        reserved_output_tokens=100,
+        auto_compact_buffer_tokens=50,
+    )
+    messages = _messages(7)
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=1_000))
+
+    assert result.context == messages
+
+
+def test_compaction_infers_auto_budget_from_model_name() -> None:
+    step = CompactConversation(
+        model="openai/mercury-2",
+        tokenizer_model=None,
+        reserved_output_tokens=8_000,
+        auto_compact_buffer_tokens=4_000,
+    )
+
+    assert step._resolve_effective_token_budget(None) == 188_000
+
+
+def test_compaction_microcompacts_bulky_terminal_output_before_summarization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    bulky_output = "\n".join(
+        [
+            "[COMMAND]",
+            "$ pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py",
+            "[TERMINAL]",
+            "Traceback (most recent call last):",
+            "FileNotFoundError: missing fixture",
+            "stderr: build failed",
+            "stdout: rerun with --verbose",
+            "[exit_code] 1",
+            "extra line " * 30,
+        ]
+    )
+    messages = [
+        {"role": "user", "content": bulky_output},
+        *_messages(9),
+    ]
+    captured_calls: list[list[dict[str, str]]] = []
+
+    def fake_generate_text(**kwargs):
+        captured_calls.append(kwargs["messages"])
+        return (
+            "Goal: debug tests.\n"
+            "Current State: investigating.\n"
+            "Important Facts: preserved.\n"
+            "Commands / Paths / Identifiers: pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py.\n"
+            "Errors / Risks: FileNotFoundError: missing fixture.\n"
+            "Next Steps: rerun."
+        )
+
+    monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+
+    step.run(PipelineState(context=messages, tools=[]), _request(token_budget=101))
+
+    prompt_content = captured_calls[0][1]["content"]
+    assert "[microcompact]" in prompt_content
+    assert "commands=pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py" in prompt_content
+    assert "errors=FileNotFoundError: missing fixture | stderr: build failed" in prompt_content
+    assert "FileNotFoundError: missing fixture" in prompt_content
+    assert "extra line extra line extra line" not in prompt_content
+
+
 def test_compaction_retries_with_second_prompt_family_when_first_output_drops_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,8 +268,8 @@ def test_compaction_retries_with_second_prompt_family_when_first_output_drops_ar
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=132))
 
     assert len(prompts) == 2
-    assert "Summarise the conversation history" in prompts[0]
-    assert "Rewrite the conversation as terse handoff notes" in prompts[1]
+    assert "compact engineering handoff" in prompts[0]
+    assert "Summarise the conversation history" in prompts[1]
     assert "pytest tests/tokentrim/transforms" in result.context[0]["content"]
     assert "FileNotFoundError: missing fixture" in result.context[0]["content"]
 

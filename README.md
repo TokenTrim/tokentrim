@@ -137,6 +137,36 @@ lists. For empty payloads, use `context=[]` or `tools=[]` explicitly.
 transforms define their own model (for example
 `CompactConversation(model=...)` and `CreateTools(model=...)`).
 
+`CompactConversation` can run in two budget modes:
+
+- explicit: pass `token_budget=...` to `Tokentrim(...)` or `.apply(...)`
+- automatic: omit `token_budget` and let compaction derive a threshold from the
+  configured model/context window
+
+For simple usage, automatic mode is usually the right choice:
+
+```python
+from tokentrim import Tokentrim
+from tokentrim.transforms import CompactConversation
+
+
+tt = Tokentrim(tokenizer="gpt-4o-mini")
+
+result = tt.compose(
+    CompactConversation(model="gpt-4o-mini", keep_last=8),
+).apply(context=messages)
+```
+
+When automatic mode is active, the derived budget is used both for deciding
+when to compact and for the pipeline's final hard budget enforcement.
+
+If you need explicit control, `CompactConversation` also accepts:
+
+- `context_window=...`
+- `reserved_output_tokens=...`
+- `auto_compact_buffer_tokens=...`
+- `auto_budget=False`
+
 `CompactConversation` also accepts `model_options` for provider-specific
 LiteLLM arguments such as `api_base`, `api_key`, or similar completion
 settings.

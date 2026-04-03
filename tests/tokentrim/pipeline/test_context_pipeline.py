@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from tokentrim.transforms.base import Transform
-from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
-from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
+from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
+from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.transforms import CompactConversation
+from tokentrim.transforms.base import Transform
 from tokentrim.types.state import PipelineState
 
 
@@ -191,3 +192,57 @@ def test_pipeline_runs_mixed_steps_against_shared_request() -> None:
     )
     assert result.tools == ({"name": "search", "description": "docs", "input_schema": {}},)
     assert [trace.step_name for trace in result.trace.steps] == ["filter", "tool-recorder"]
+
+
+def test_pipeline_uses_auto_budget_from_compaction_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = UnifiedPipeline(tokenizer_model=None)
+    request = ContextRequest(
+        messages=tuple({"role": "user", "content": "x" * 80} for _ in range(6)),
+        user_id=None,
+        session_id=None,
+        token_budget=None,
+        steps=(
+            CompactConversation(
+                model="gpt-4o-mini",
+                keep_last=0,
+                context_window=120,
+                reserved_output_tokens=20,
+                auto_compact_buffer_tokens=10,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = pipeline.run(request)
+
+    assert result.trace.token_budget == 90
+    assert result.context[0]["role"] == "system"
+
+
+def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget() -> None:
+    pipeline = UnifiedPipeline(tokenizer_model=None)
+    request = ContextRequest(
+        messages=({"role": "user", "content": "x" * 120},),
+        user_id=None,
+        session_id=None,
+        token_budget=None,
+        steps=(
+            CompactConversation(
+                model="gpt-4o-mini",
+                auto_budget=True,
+                context_window=60,
+                reserved_output_tokens=20,
+                auto_compact_buffer_tokens=10,
+                enable_microcompact=False,
+            ),
+        ),
+    )
+
+    with pytest.raises(BudgetExceededError) as exc_info:
+        pipeline.run(request)
+
+    assert exc_info.value.budget == 30
