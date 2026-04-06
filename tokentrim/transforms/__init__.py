@@ -17,11 +17,9 @@ __all__ = [
     "CompressToolDescriptions",
     "CreateTools",
     "FilterMessages",
-    "MemoryStore",
     "MicrocompactConfig",
     "MicrocompactMessages",
     "MicrocompactOrchestrator",
-    "NoOpMemoryStore",
     "RetrieveMemory",
     "Transform",
 ]
