@@ -10,21 +10,15 @@ import tokentrim.tracing as tracing_module
 from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
+from tokentrim.memory import LocalDirectoryMemoryStore
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.tracing import InMemoryTraceStore, PipelineSpan, PipelineTracer
 from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
+from tokentrim.types.tool import Tool
 from tokentrim.types.trace import Trace
-from tokentrim.transforms import CompactConversation, CompressToolDescriptions, CreateTools
-from tokentrim.transforms import FilterMessages, RetrieveMemory
+from tokentrim.transforms import CompactConversation, RetrieveDurableMemory
 from tokentrim.transforms.base import Transform
-
-
-class InMemoryStore:
-    def retrieve(self, *, user_id: str, session_id: str) -> str | None:
-        if user_id == "u1" and session_id == "s1":
-            return "stored context"
-        return None
 
 
 class EchoAdapter(IntegrationAdapter[str]):
@@ -76,6 +70,41 @@ class ExplodingTransform(Transform):
         raise RuntimeError("boom")
 
 
+class TestFilterTransform(Transform):
+    @property
+    def name(self) -> str:
+        return "test-filter"
+
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        del request
+        filtered = [message for message in state.context if message["content"].strip()]
+        return PipelineState(context=filtered, tools=state.tools)
+
+
+class TestToolTransform(Transform):
+    @property
+    def name(self) -> str:
+        return "test-tools"
+
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        del request
+        tools: list[Tool] = list(state.tools)
+        if tools:
+            tools[0] = {
+                "name": tools[0]["name"],
+                "description": "normalized",
+                "input_schema": tools[0]["input_schema"],
+            }
+        tools.append(
+            {
+                "name": "lookup",
+                "description": "new tool",
+                "input_schema": {"type": "object"},
+            }
+        )
+        return PipelineState(context=state.context, tools=tools)
+
+
 def test_constructor_wires_tokenizer_model() -> None:
     client = Tokentrim(tokenizer="shared-model")
 
@@ -101,7 +130,7 @@ def test_default_token_budget_propagates_to_compose_apply(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    result = client.compose(FilterMessages()).apply(context=[])
+    result = client.compose(TestFilterTransform()).apply(context=[])
 
     assert captured["token_budget"] == 123
     assert result.trace.id == "trace"
@@ -127,7 +156,7 @@ def test_compose_apply_propagates_trace_store(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    client.compose(FilterMessages()).apply(context=[], trace_store=trace_store)
+    client.compose(TestFilterTransform()).apply(context=[], trace_store=trace_store)
 
     assert captured["trace_store"] is trace_store
 
@@ -152,23 +181,26 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    client.compose(FilterMessages()).apply(context=[], pipeline_tracer=pipeline_tracer)
+    client.compose(TestFilterTransform()).apply(context=[], pipeline_tracer=pipeline_tracer)
 
     assert captured["pipeline_tracer"] is pipeline_tracer
 
 
-def test_rlm_store_belongs_to_rlm_transform() -> None:
-    store = InMemoryStore()
+def test_durable_memory_store_belongs_to_memory_transform(tmp_path) -> None:
+    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
+    store.remember(user_id="u1", session_id="s1", content="stored context about hello")
     client = Tokentrim()
     messages = [{"role": "user", "content": "hello"}]
 
-    result = client.compose(RetrieveMemory(memory_store=store)).apply(
+    result = client.compose(RetrieveDurableMemory(memory_store=store)).apply(
         messages,
         user_id="u1",
         session_id="s1",
     )
 
-    assert result.context[0] == {"role": "system", "content": "stored context"}
+    assert result.context[0]["role"] == "system"
+    assert "Durable memory only." in result.context[0]["content"]
+    assert "stored context about hello" in result.context[0]["content"]
 
 
 def test_constructor_does_not_define_per_transform_models() -> None:
@@ -197,7 +229,7 @@ def test_per_call_token_budget_overrides_default(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(client._pipeline, "run", fake_run)
 
-    result = client.compose(CompressToolDescriptions()).apply(tools=[], token_budget=9)
+    result = client.compose(TestToolTransform()).apply(tools=[], token_budget=9)
 
     assert captured["token_budget"] == 9
     assert result.trace.id == "trace"
@@ -226,11 +258,17 @@ def test_public_tracing_exports_use_canonical_names() -> None:
     assert not hasattr(tracing_module, "IdentitySpanRecord")
 
 
+def test_public_top_level_exports_include_primary_transforms() -> None:
+    assert hasattr(tokentrim_module, "CompactConversation")
+    assert hasattr(tokentrim_module, "RetrieveDurableMemory")
+    assert hasattr(tokentrim_module, "RememberDurableMemory")
+
+
 def test_compose_apply_returns_frozen_result_objects() -> None:
     client = Tokentrim()
 
-    context_result = client.compose(FilterMessages()).apply(context=[])
-    tools_result = client.compose(CompressToolDescriptions()).apply(tools=[])
+    context_result = client.compose(TestFilterTransform()).apply(context=[])
+    tools_result = client.compose(TestToolTransform()).apply(tools=[])
 
     with pytest.raises((FrozenInstanceError, TypeError)):
         context_result.trace.id = "other"
@@ -246,7 +284,7 @@ def test_unified_pipeline_emits_transform_span_via_pipeline_tracer() -> None:
     client = Tokentrim()
     pipeline_tracer = RecordingPipelineTracer()
 
-    result = client.compose(FilterMessages()).apply(
+    result = client.compose(TestFilterTransform()).apply(
         context=[
             {"role": "user", "content": "keep"},
             {"role": "assistant", "content": "   "},
@@ -257,11 +295,11 @@ def test_unified_pipeline_emits_transform_span_via_pipeline_tracer() -> None:
     assert [message["content"] for message in result.context] == ["keep"]
     assert len(pipeline_tracer.spans) == 1
     span = pipeline_tracer.spans[0]
-    assert span.name == "tokentrim.transform.filter"
+    assert span.name == "tokentrim.transform.test-filter"
     assert span.error is None
     assert span.data == {
         "kind": "transform",
-        "transform_name": "filter",
+        "transform_name": "test-filter",
         "input_items": 2,
         "input_tokens": result.trace.steps[0].input_tokens,
         "output_items": 1,
@@ -285,10 +323,13 @@ def test_unified_pipeline_records_transform_span_errors() -> None:
     assert pipeline_tracer.spans[0].error == "RuntimeError"
 
 
-def test_compose_apply_context_wires_filter_compaction_and_rlm(
+def test_compose_apply_context_wires_compaction_and_memory(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     client = Tokentrim()
+    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
+    store.remember(user_id="u1", session_id="s1", content="stored context about issue-five")
     messages = [
         {"role": "user", "content": "old-a " * 20},
         {"role": "assistant", "content": "old-b " * 20},
@@ -297,7 +338,7 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
         {"role": "assistant", "content": "2"},
         {"role": "user", "content": "3"},
         {"role": "assistant", "content": "4"},
-        {"role": "user", "content": "5"},
+        {"role": "user", "content": "issue-five"},
         {"role": "assistant", "content": "6"},
     ]
 
@@ -305,36 +346,37 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
+    original_message_count = len(messages)
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
     result = client.compose(
-        FilterMessages(),
         CompactConversation(model="compact-model"),
-        RetrieveMemory(memory_store=InMemoryStore()),
+        RetrieveDurableMemory(memory_store=store),
     ).apply(
         messages,
         user_id="u1",
         session_id="s1",
-        token_budget=30,
+        token_budget=200,
     )
 
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
     assert result.context[0]["role"] == "system"
-    assert "stored context" in result.context[0]["content"]
+    assert result.context[1]["role"] == "system"
     assert "summary" in result.context[0]["content"]
-    assert [trace.step_name for trace in result.trace.steps] == [
-        "filter",
-        "compaction",
-        "rlm",
-    ]
+    assert "Durable memory only." in result.context[1]["content"]
+    assert "stored context about issue-five" in result.context[1]["content"]
+    assert [trace.step_name for trace in result.trace.steps] == ["compaction", "durable_memory"]
     assert all(message["content"].strip() for message in result.context)
     assert result.trace.output_tokens > 0
-    assert result.trace.input_tokens >= result.trace.output_tokens
 
 
-def test_compose_apply_tools_wires_bpe_and_creator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compose_apply_tools_wires_local_tool_transform() -> None:
     client = Tokentrim()
     tools = [
         {
@@ -344,18 +386,8 @@ def test_compose_apply_tools_wires_bpe_and_creator(
         }
     ]
 
-    monkeypatch.setattr(
-        "tokentrim.transforms.create_tools.transform.generate_text",
-        lambda **kwargs: (
-            '{"tools": ['
-            '{"name": "search", "description": "duplicate", "input_schema": {}}, '
-            '{"name": "lookup", "description": "new tool", "input_schema": {"type": "object"}}'
-            "]}"
-        ),
-    )
     result = client.compose(
-        CompressToolDescriptions(),
-        CreateTools(model="creator-model"),
+        TestToolTransform(),
     ).apply(
         tools,
         task_hint="investigate",
@@ -364,17 +396,14 @@ def test_compose_apply_tools_wires_bpe_and_creator(
     assert isinstance(result.tools, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
-    assert result.tools[0]["description"] == "search the docs"
+    assert result.tools[0]["description"] == "normalized"
     assert [tool["name"] for tool in result.tools] == ["search", "lookup"]
-    assert [trace.step_name for trace in result.trace.steps] == ["bpe", "creator"]
-    assert [trace.output_items - trace.input_items for trace in result.trace.steps] == [0, 1]
+    assert [trace.step_name for trace in result.trace.steps] == ["test-tools"]
     assert result.trace.output_tokens > 0
     assert result.trace.output_tokens >= result.trace.input_tokens
 
 
-def test_compose_apply_supports_mixed_context_and_tool_steps(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_compose_apply_supports_mixed_context_and_tool_steps() -> None:
     client = Tokentrim()
     messages = [
         {"role": "user", "content": "hello"},
@@ -388,14 +417,9 @@ def test_compose_apply_supports_mixed_context_and_tool_steps(
         }
     ]
 
-    monkeypatch.setattr(
-        "tokentrim.transforms.create_tools.transform.generate_text",
-        lambda **kwargs: '{"tools": [{"name": "lookup", "description": "new tool", "input_schema": {}}]}',
-    )
     result = client.compose(
-        FilterMessages(),
-        CompressToolDescriptions(),
-        CreateTools(model="creator-model"),
+        TestFilterTransform(),
+        TestToolTransform(),
     ).apply(
         context=messages,
         tools=tools,
@@ -404,7 +428,7 @@ def test_compose_apply_supports_mixed_context_and_tool_steps(
 
     assert result.context == ({"role": "user", "content": "hello"},)
     assert [tool["name"] for tool in result.tools] == ["search", "lookup"]
-    assert [trace.step_name for trace in result.trace.steps] == ["filter", "bpe", "creator"]
+    assert [trace.step_name for trace in result.trace.steps] == ["test-filter", "test-tools"]
 
 
 def test_compose_apply_rejects_empty_payload_when_no_steps() -> None:
@@ -416,15 +440,43 @@ def test_compose_apply_rejects_empty_payload_when_no_steps() -> None:
     assert "cannot infer payload kind" in str(exc_info.value)
 
 
+def test_compose_apply_rejects_mixed_positional_payload_entries() -> None:
+    client = Tokentrim()
+
+    with pytest.raises(TokentrimError) as exc_info:
+        client.compose().apply(
+            [
+                {"role": "user", "content": "hello"},
+                {"name": "search", "description": "docs", "input_schema": {"type": "object"}},
+            ]
+        )
+
+    assert "must not mix messages and tools" in str(exc_info.value)
+
+
+def test_compose_apply_rejects_invalid_positional_payload_entry_shape() -> None:
+    client = Tokentrim()
+
+    with pytest.raises(TokentrimError) as exc_info:
+        client.compose().apply(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant"},
+            ]
+        )
+
+    assert "must all be message-shaped or tool-shaped dicts" in str(exc_info.value)
+
+
 def test_compose_to_openai_agents_builds_run_config_for_any_pipeline() -> None:
     client = Tokentrim()
 
     if importlib.util.find_spec("agents") is None:
         with pytest.raises(TokentrimError) as exc_info:
-            client.compose(CompressToolDescriptions()).to_openai_agents()
+            client.compose(TestToolTransform()).to_openai_agents()
         assert "openai-agents is required" in str(exc_info.value)
         return
 
-    wrapped = client.compose(CompressToolDescriptions()).to_openai_agents()
+    wrapped = client.compose(TestToolTransform()).to_openai_agents()
 
     assert wrapped.call_model_input_filter is not None

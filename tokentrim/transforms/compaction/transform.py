@@ -15,6 +15,7 @@ from typing import Final
 
 from tokentrim.core.llm_client import generate_text
 from tokentrim.core.token_counting import count_message_tokens
+from tokentrim.working_state import extract_working_state, render_working_state_message
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.compaction.microcompact import (
@@ -26,6 +27,7 @@ from tokentrim.transforms.compaction.error import (
     CompactionExecutionError,
     CompactionOutputError,
 )
+from tokentrim.transforms.compaction.context_edit import ContextEditor
 from tokentrim.types.message import Message
 from tokentrim.types.state import PipelineState
 
@@ -56,6 +58,29 @@ UNCOMPACTED_TRANSCRIPT_THRESHOLD: Final[int] = 2_500
 
 # Prefix for summary system messages, marking them as historical context.
 SUMMARY_SYSTEM_PREFIX: Final[str] = "History only."
+
+SUMMARY_SECTIONS: Final[tuple[str, ...]] = (
+    "Goal",
+    "Active State",
+    "Critical Artifacts",
+    "Open Risks",
+    "Next Step",
+    "Older Context",
+)
+
+_SUMMARY_SECTION_ALIASES: Final[dict[str, tuple[str, ...]]] = {
+    "Goal": ("Goal",),
+    "Active State": ("Active State", "Current State"),
+    "Critical Artifacts": (
+        "Critical Artifacts",
+        "Important Facts",
+        "Facts",
+        "Commands / Paths / Identifiers",
+    ),
+    "Open Risks": ("Open Risks", "Errors / Risks", "Risks", "Risk"),
+    "Next Step": ("Next Step", "Next Steps"),
+    "Older Context": ("Older Context",),
+}
 
 
 # =============================================================================
@@ -135,11 +160,11 @@ _PROMPT_TEMPLATES: Final[dict[str, PromptTemplate]] = {
         user_template=(
             "Write a concise handoff using these exact headings:\n"
             "Goal:\n"
-            "Current State:\n"
-            "Important Facts:\n"
-            "Commands / Paths / Identifiers:\n"
-            "Errors / Risks:\n"
-            "Next Steps:\n"
+            "Active State:\n"
+            "Critical Artifacts:\n"
+            "Open Risks:\n"
+            "Next Step:\n"
+            "Older Context:\n"
             "Preserve commands, file paths, identifiers, and error strings exactly when relevant.\n"
             "Artifacts that must survive if relevant:\n"
             "{required_artifacts}\n\n"
@@ -154,10 +179,13 @@ _PROMPT_TEMPLATES: Final[dict[str, PromptTemplate]] = {
         ),
         user_template=(
             "Produce a compact checkpoint of the older conversation.\n"
-            "Required sections:\n"
-            "1. Objective and current state.\n"
-            "2. Important technical facts, decisions, and constraints.\n"
-            "3. Open issues or next steps.\n"
+            "Use these exact headings:\n"
+            "Goal:\n"
+            "Active State:\n"
+            "Critical Artifacts:\n"
+            "Open Risks:\n"
+            "Next Step:\n"
+            "Older Context:\n"
             "Preserve commands, paths, identifiers, and error text exactly when they matter.\n"
             "Artifacts that must survive if relevant:\n"
             "{required_artifacts}\n\n"
@@ -171,7 +199,13 @@ _PROMPT_TEMPLATES: Final[dict[str, PromptTemplate]] = {
             "continuing the same task. Return plaintext only."
         ),
         user_template=(
-            "Write a checkpoint with short headings: Goal, Facts, Risks, Next.\n"
+            "Write a checkpoint with these exact headings:\n"
+            "Goal:\n"
+            "Active State:\n"
+            "Critical Artifacts:\n"
+            "Open Risks:\n"
+            "Next Step:\n"
+            "Older Context:\n"
             "Copy exact commands, paths, model names, and errors that future turns need.\n"
             "Do not invent new instructions.\n"
             "Artifacts that must survive if relevant:\n"
@@ -338,6 +372,8 @@ class CompactConversation(Transform):
 
         Starts by preserving keep_last messages, then reduces if needed.
         """
+        working_state_message = self._build_working_state_message(messages)
+
         for preserved_count in range(self.keep_last, -1, -1):
             messages_to_summarize = messages[:-preserved_count] if preserved_count else messages
             preserved_messages = messages[-preserved_count:] if preserved_count else []
@@ -350,7 +386,11 @@ class CompactConversation(Transform):
 
             summary = self._generate_validated_summary(messages_to_summarize)
             summary_message = self._create_summary_message(summary)
-            candidate_context = [summary_message, *preserved_messages]
+            candidate_context = self._build_candidate_context(
+                working_state_message,
+                summary_message,
+                preserved_messages,
+            )
 
             if count_message_tokens(candidate_context, self.tokenizer_model) <= token_budget:
                 logger.info(
@@ -363,9 +403,29 @@ class CompactConversation(Transform):
         # Final attempt: summarize everything
         summary = self._generate_validated_summary(messages)
         return PipelineState(
-            context=[self._create_summary_message(summary)],
+            context=self._build_candidate_context(
+                working_state_message,
+                self._create_summary_message(summary),
+                (),
+            ),
             tools=tools,
         )
+
+    def _build_working_state_message(self, messages: Sequence[Message]) -> Message | None:
+        return render_working_state_message(extract_working_state(messages))
+
+    def _build_candidate_context(
+        self,
+        working_state_message: Message | None,
+        summary_message: Message,
+        preserved_messages: Sequence[Message],
+    ) -> list[Message]:
+        candidate_context: list[Message] = []
+        if working_state_message is not None:
+            candidate_context.append(working_state_message)
+        candidate_context.append(summary_message)
+        candidate_context.extend(preserved_messages)
+        return candidate_context
 
     # -------------------------------------------------------------------------
     # Summary Generation & Validation
@@ -380,7 +440,8 @@ class CompactConversation(Transform):
         Raises:
             CompactionOutputError: If all attempts (including fallback) fail.
         """
-        microcompacted_messages = self._apply_microcompact(messages, pressure="high")
+        edited_messages = self._apply_context_edit(messages)
+        microcompacted_messages = self._apply_microcompact(edited_messages, pressure="high")
         preserved_artifacts = self._extract_preserved_artifacts(microcompacted_messages)
         validation_failures: list[str] = []
 
@@ -391,7 +452,7 @@ class CompactConversation(Transform):
                 template,
                 preserved_artifacts,
             )
-            summary = self._normalize_whitespace(raw_summary)
+            summary = self._normalize_summary_output(raw_summary, preserved_artifacts)
 
             problems = self._validate_summary(
                 microcompacted_messages,
@@ -497,6 +558,12 @@ class CompactConversation(Transform):
         if require_shorter and len(summary) >= source_length:
             problems.append("not materially shorter than source")
 
+        missing_sections = [
+            heading for heading in SUMMARY_SECTIONS if f"{heading}:" not in summary
+        ]
+        if missing_sections:
+            problems.append(f"missing sections: {', '.join(missing_sections)}")
+
         # Check that most artifacts are preserved (allow 1 missing)
         missing = [a for a in preserved_artifacts if a.lower() not in summary.lower()]
         if len(missing) > 1:
@@ -519,16 +586,17 @@ class CompactConversation(Transform):
         preserved_artifacts: Sequence[str],
     ) -> str:
         """Build a simple summary from recent messages when LLM fails."""
-        sections: list[str] = []
-
-        # Include notes from last 2 messages
         turn_notes = self._extract_recent_turn_notes(messages)
-        sections.append("Checkpoint: " + " | ".join(turn_notes))
-
-        if preserved_artifacts:
-            sections.append("Preserve exactly: " + " | ".join(preserved_artifacts))
-
-        return "\n".join(sections).strip()
+        return self._render_summary_sections(
+            {
+                "Goal": self._extract_fallback_goal(messages),
+                "Active State": " | ".join(turn_notes),
+                "Critical Artifacts": " | ".join(preserved_artifacts) if preserved_artifacts else "- none",
+                "Open Risks": self._extract_fallback_risks(messages),
+                "Next Step": self._extract_fallback_next_step(messages),
+                "Older Context": "- compacted from earlier turns",
+            }
+        )
 
     def _extract_recent_turn_notes(self, messages: Sequence[Message]) -> list[str]:
         """Extract brief notes from the last 2 messages for fallback summary."""
@@ -542,6 +610,38 @@ class CompactConversation(Transform):
             if content:
                 notes.append(f"{role}: {content}")
         return notes or ["Prior turns contained no compactable content."]
+
+    def _extract_fallback_goal(self, messages: Sequence[Message]) -> str:
+        for message in messages:
+            if message["role"] != "user":
+                continue
+            content = self._truncate_with_ellipsis(
+                self._normalize_whitespace(message["content"]),
+                limit=FALLBACK_TRUNCATION_LIMIT,
+            )
+            if content:
+                return content
+        return "- not captured"
+
+    def _extract_fallback_risks(self, messages: Sequence[Message]) -> str:
+        risks = [
+            self._strip_punctuation(match.group(0).strip())
+            for message in messages
+            for match in _ERROR_LINE_RE.finditer(message["content"])
+        ]
+        return " | ".join(risks[:2]) if risks else "- none"
+
+    def _extract_fallback_next_step(self, messages: Sequence[Message]) -> str:
+        for message in reversed(messages):
+            if message["role"] != "assistant":
+                continue
+            content = self._truncate_with_ellipsis(
+                self._normalize_whitespace(message["content"]),
+                limit=FALLBACK_TRUNCATION_LIMIT,
+            )
+            if content:
+                return content
+        return "- review preserved recent messages"
 
     # -------------------------------------------------------------------------
     # Deterministic Microcompact
@@ -561,6 +661,10 @@ class CompactConversation(Transform):
             tokenizer_model=self.tokenizer_model,
         )
         return orchestrator.apply(list(messages), pressure=pressure)
+
+    def _apply_context_edit(self, messages: Sequence[Message]) -> list[Message]:
+        editor = ContextEditor()
+        return editor.apply(messages)
 
     # -------------------------------------------------------------------------
     # Artifact Extraction
@@ -640,6 +744,77 @@ class CompactConversation(Transform):
             f"[{i}] role={msg['role']}\n{msg['content']}"
             for i, msg in enumerate(messages, start=1)
         )
+
+    def _normalize_summary_output(
+        self,
+        raw_summary: str,
+        preserved_artifacts: Sequence[str],
+    ) -> str:
+        normalized = raw_summary.replace("\r\n", "\n").strip()
+        parsed = self._parse_summary_sections(normalized)
+        if parsed:
+            parsed.setdefault(
+                "Critical Artifacts",
+                " | ".join(preserved_artifacts) if preserved_artifacts else "- none",
+            )
+            parsed.setdefault("Open Risks", "- none")
+            parsed.setdefault("Next Step", "- not captured")
+            parsed.setdefault("Older Context", "- none")
+            parsed.setdefault("Active State", "- none")
+            parsed.setdefault("Goal", "- not captured")
+            return self._render_summary_sections(parsed)
+
+        return self._render_summary_sections(
+            {
+                "Goal": "- not captured",
+                "Active State": "- not captured",
+                "Critical Artifacts": " | ".join(preserved_artifacts) if preserved_artifacts else "- none",
+                "Open Risks": "- none",
+                "Next Step": "- not captured",
+                "Older Context": self._normalize_whitespace(normalized) or "- none",
+            }
+        )
+
+    def _parse_summary_sections(self, summary: str) -> dict[str, str]:
+        alias_to_canonical = {
+            alias.lower(): canonical
+            for canonical, aliases in _SUMMARY_SECTION_ALIASES.items()
+            for alias in aliases
+        }
+        parsed: dict[str, str] = {}
+        current_heading: str | None = None
+        buffer: list[str] = []
+
+        for raw_line in summary.splitlines():
+            line = raw_line.strip()
+            if line.endswith(":"):
+                canonical = alias_to_canonical.get(line[:-1].strip().lower())
+                if canonical is not None:
+                    if current_heading is not None:
+                        parsed[current_heading] = self._normalize_section_body(buffer)
+                    current_heading = canonical
+                    buffer = []
+                    continue
+            if current_heading is not None:
+                buffer.append(raw_line)
+
+        if current_heading is not None:
+            parsed[current_heading] = self._normalize_section_body(buffer)
+
+        return parsed
+
+    def _normalize_section_body(self, lines: Sequence[str]) -> str:
+        cleaned = [line.strip() for line in lines if line.strip()]
+        if not cleaned:
+            return "- none"
+        return "\n".join(cleaned)
+
+    def _render_summary_sections(self, sections: Mapping[str, str]) -> str:
+        rendered: list[str] = []
+        for heading in SUMMARY_SECTIONS:
+            body = sections.get(heading, "- none").strip() or "- none"
+            rendered.append(f"{heading}:\n{body}")
+        return "\n\n".join(rendered)
 
     def _create_summary_message(self, summary: str) -> Message:
         """Wrap summary in a system message with the history prefix."""

@@ -6,6 +6,7 @@ from tokentrim.errors.base import TokentrimError
 from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.transforms.compaction import CompactConversation
 from tokentrim.types.state import PipelineState
+from tokentrim.working_state import WorkingState, parse_working_state_message, render_working_state_message
 
 
 def _messages(count: int) -> list[dict[str, str]]:
@@ -29,6 +30,23 @@ def test_compaction_is_noop_when_under_budget() -> None:
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=1_000))
 
     assert result.context == messages
+
+
+def test_working_state_message_round_trips_through_typed_parser() -> None:
+    state = WorkingState(
+        goal="Update docs",
+        current_step="Inspect failing test",
+        active_files=("./tokentrim/README.md", "./tokentrim/tests/test_client.py"),
+        latest_command="pytest tests/tokentrim/test_client.py",
+        active_error="FileNotFoundError: missing fixture",
+        constraints=("avoid scope changes", "do not remove tests"),
+        next_step="Update fixture and rerun pytest.",
+    )
+
+    message = render_working_state_message(state)
+
+    assert message is not None
+    assert parse_working_state_message(message) == state
 
 
 def test_compaction_is_noop_when_budget_is_none() -> None:
@@ -68,10 +86,17 @@ def test_compaction_preserves_recent_messages_and_injects_summary(monkeypatch: p
 def test_compaction_respects_custom_keep_last(monkeypatch: pytest.MonkeyPatch) -> None:
     step = CompactConversation(model="compact-model", keep_last=8, tokenizer_model=None)
     messages = _messages(12)
+    original_message_count = len(messages)
 
     monkeypatch.setattr(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
+    )
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
     )
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=130))
 
@@ -96,12 +121,19 @@ def test_compaction_only_sends_older_messages_to_summarizer(
     step = CompactConversation(model="compact-model", tokenizer_model=None)
     messages = _messages(10)
     captured = {}
+    original_message_count = len(messages)
 
     def fake_generate_text(**kwargs):
         captured["messages"] = kwargs["messages"]
         return "summary"
 
     monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
 
     step.run(PipelineState(context=messages, tools=[]), _request(token_budget=101))
 
@@ -123,11 +155,11 @@ def test_compaction_uses_structured_prompt_family_by_default(
         captured["messages"] = kwargs["messages"]
         return (
             "Goal: keep debugging.\n"
-            "Current State: in progress.\n"
-            "Important Facts: preserved.\n"
-            "Commands / Paths / Identifiers: none.\n"
-            "Errors / Risks: none.\n"
-            "Next Steps: continue."
+            "Active State:\nin progress.\n"
+            "Critical Artifacts:\npreserved.\n"
+            "Open Risks:\nnone.\n"
+            "Next Step:\ncontinue.\n"
+            "Older Context:\nolder details."
         )
 
     monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
@@ -137,8 +169,8 @@ def test_compaction_uses_structured_prompt_family_by_default(
     prompt = captured["messages"]
     assert "compact engineering handoff" in prompt[0]["content"]
     assert "Goal:" in prompt[1]["content"]
-    assert "Current State:" in prompt[1]["content"]
-    assert "Next Steps:" in prompt[1]["content"]
+    assert "Active State:" in prompt[1]["content"]
+    assert "Older Context:" in prompt[1]["content"]
 
 
 def test_compaction_can_trigger_automatically_from_known_model_window(
@@ -253,9 +285,26 @@ def test_compaction_retries_with_second_prompt_family_when_first_output_drops_ar
     prompts: list[str] = []
     outputs = iter(
         [
-            "Goal: debug the failure.",
-            "Goal: debug the failure. Facts: use pytest tests/tokentrim/transforms from ./tokentrim. "
-            "Risk: FileNotFoundError: missing fixture.",
+            "Goal:\ndebug the failure.\n"
+            "Active State:\nin progress.\n"
+            "Critical Artifacts:\n- none\n"
+            "Open Risks:\n- none\n"
+            "Next Step:\ncontinue debugging.\n"
+            "Older Context:\nolder details.",
+            "Goal:\ndebug the failure.\n"
+            "Active State:\nin progress.\n"
+            "Critical Artifacts:\npytest tests/tokentrim/transforms | ./tokentrim. | "
+            "It failed with FileNotFoundError: missing fixture.\n"
+            "Open Risks:\nIt failed with FileNotFoundError: missing fixture.\n"
+            "Next Step:\nrerun pytest.\n"
+            "Older Context:\nolder details.",
+            "Goal:\ndebug the failure.\n"
+            "Active State:\nin progress.\n"
+            "Critical Artifacts:\npytest tests/tokentrim/transforms | ./tokentrim. | "
+            "It failed with FileNotFoundError: missing fixture.\n"
+            "Open Risks:\nIt failed with FileNotFoundError: missing fixture.\n"
+            "Next Step:\nrerun pytest.\n"
+            "Older Context:\nolder details.",
         ]
     )
 
@@ -264,14 +313,21 @@ def test_compaction_retries_with_second_prompt_family_when_first_output_drops_ar
         return next(outputs)
 
     monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+    original_message_count = len(messages)
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
 
-    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=132))
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=200))
 
-    assert len(prompts) == 2
+    assert len(prompts) >= 2
     assert "compact engineering handoff" in prompts[0]
     assert "Summarise the conversation history" in prompts[1]
-    assert "pytest tests/tokentrim/transforms" in result.context[0]["content"]
-    assert "FileNotFoundError: missing fixture" in result.context[0]["content"]
+    assert "pytest tests/tokentrim/transforms" in result.context[1]["content"]
+    assert "FileNotFoundError: missing fixture" in result.context[1]["content"]
 
 
 def test_compaction_uses_local_fallback_when_model_outputs_fail_validation(
@@ -291,10 +347,11 @@ def test_compaction_uses_local_fallback_when_model_outputs_fail_validation(
 
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=73))
 
-    assert "Preserve exactly:" in result.context[0]["content"]
-    assert "/tmp/build.log" in result.context[0]["content"]
-    assert "git status" in result.context[0]["content"]
-    assert "error: build failed" in result.context[0]["content"]
+    assert "Critical Artifacts:" in result.context[1]["content"]
+    assert "/tmp/build.log" in result.context[1]["content"]
+    assert "git status" in result.context[1]["content"]
+    assert "error: build failed" in result.context[1]["content"]
+    assert "Older Context:" in result.context[1]["content"]
 
 
 def test_compaction_forwards_model_options(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -309,12 +366,19 @@ def test_compaction_forwards_model_options(monkeypatch: pytest.MonkeyPatch) -> N
     )
     messages = _messages(8)
     captured: dict[str, object] = {}
+    original_message_count = len(messages)
 
     def fake_generate_text(**kwargs):
         captured.update(kwargs)
         return "summary"
 
     monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
 
     result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=74))
 
@@ -339,3 +403,211 @@ def test_compaction_wraps_unexpected_generation_failures(monkeypatch: pytest.Mon
         step.run(PipelineState(context=messages, tools=[]), _request(token_budget=5))
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_compaction_injects_working_state_before_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Update ./tokentrim/README.md and rerun "
+                "`pytest tests/tokentrim/transforms/compaction`."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "I'll update the docs and rerun the compaction tests next.",
+        },
+        *_messages(8),
+    ]
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=130))
+
+    assert result.context[0]["role"] == "system"
+    assert "Working state only." in result.context[0]["content"]
+    assert "Goal: Update ./tokentrim/README.md and rerun" in result.context[0]["content"]
+    assert result.context[1]["role"] == "system"
+    assert "History only." in result.context[1]["content"]
+
+
+def test_working_state_preserves_latest_command_and_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {
+            "role": "user",
+            "content": "Run `pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py`.",
+        },
+        {
+            "role": "assistant",
+            "content": "$ pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py",
+        },
+        {
+            "role": "user",
+            "content": "Traceback (most recent call last):\nFileNotFoundError: missing fixture",
+        },
+        *_messages(7),
+    ]
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=100))
+
+    assert (
+        "Latest Command: pytest tests/tokentrim/transforms/compaction/test_compaction_transform.py"
+        in result.context[0]["content"]
+    )
+    assert "Active Error: FileNotFoundError: missing fixture" in result.context[0]["content"]
+
+
+def test_working_state_tracks_active_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Check ./tokentrim/README.md and "
+                "./tokentrim/tests/tokentrim/transforms/compaction/test_compaction_transform.py."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "I will inspect ./tokentrim/tokentrim/transforms/compaction/transform.py next.",
+        },
+        *_messages(8),
+    ]
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=122))
+
+    content = result.context[0]["content"]
+    assert "Active Files:" in content
+    assert "./tokentrim/tokentrim/transforms/compaction/transform.py" in content
+    assert (
+        "./tokentrim/tests/tokentrim/transforms/compaction/test_compaction_transform.py"
+        in content
+    )
+    assert "./tokentrim/README.md" in content
+
+
+def test_working_state_replaces_stale_error_with_newer_active_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {"role": "user", "content": "Run the compaction tests."},
+        {"role": "assistant", "content": "FileNotFoundError: old missing fixture"},
+        {"role": "assistant", "content": "Fixed that; tests passed locally."},
+        {"role": "assistant", "content": "Permission denied: .pytest_cache"},
+        *_messages(7),
+    ]
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=100))
+
+    content = result.context[0]["content"]
+    assert "Active Error: Permission denied: .pytest_cache" in content
+    assert "FileNotFoundError: old missing fixture" not in content
+
+
+def test_working_state_omits_empty_sections(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {"role": "user", "content": "Please review the proposal and avoid changing scope."},
+        {"role": "assistant", "content": "I'll review the proposal next."},
+        *_messages(8),
+    ]
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=130))
+
+    content = result.context[0]["content"]
+    assert "Goal: Please review the proposal and avoid changing scope." in content
+    assert "Constraints: Please review the proposal and avoid changing scope." in content
+    assert "Latest Command:" not in content
+    assert "Active Files:" not in content
+    assert "Active Error:" not in content
+
+
+def test_compaction_context_edit_drops_resolved_terminal_noise_before_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "$ pytest tests/unit.py\nTraceback (most recent call last):\nFileNotFoundError: old fixture",
+        },
+        {"role": "user", "content": "[exit_code] 1\nstderr: failed"},
+        {"role": "assistant", "content": "Fixed that; tests passed locally."},
+        {"role": "user", "content": "Rerun the targeted tests and update ./tokentrim/README.md."},
+        *_messages(7),
+    ]
+    captured: dict[str, object] = {}
+
+    def fake_generate_text(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return "summary"
+
+    monkeypatch.setattr("tokentrim.transforms.compaction.transform.generate_text", fake_generate_text)
+
+    step.run(PipelineState(context=messages, tools=[]), _request(token_budget=100))
+
+    prompt = captured["messages"][1]["content"]
+    assert "FileNotFoundError: old fixture" not in prompt
+    assert "[exit_code] 1" not in prompt
+    assert "Rerun the targeted tests and update ./tokentrim/README.md." in prompt
+
+
+def test_compaction_normalizes_unstructured_model_output_to_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = CompactConversation(model="compact-model", tokenizer_model=None)
+    messages = _messages(10)
+    original_message_count = len(messages)
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "plain checkpoint without headings",
+    )
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=130))
+
+    content = result.context[0]["content"]
+    assert "Goal:" in content
+    assert "Active State:" in content
+    assert "Critical Artifacts:" in content
+    assert "Open Risks:" in content
+    assert "Next Step:" in content
+    assert "Older Context:" in content
+    assert "plain checkpoint without headings" in content

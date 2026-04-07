@@ -33,7 +33,19 @@ from tokentrim.integrations.openai_agents.tracing import (
     build_identity_trace_metadata,
     install_identity_processor,
 )
-from tokentrim.transforms import FilterMessages
+from tokentrim.transforms.base import Transform
+from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.types.state import PipelineState
+
+
+class TestFilterTransform(Transform):
+    @property
+    def name(self) -> str:
+        return "test-filter"
+
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        del request
+        return PipelineState(context=state.context, tools=state.tools)
 
 
 class RecordingSession:
@@ -309,10 +321,10 @@ def test_identity_processor_persists_openai_export_payloads(isolated_trace_proce
     with trace("Agent workflow", metadata=metadata):
         with agent_span(name="assistant"):
             with custom_span(
-                "tokentrim.transform.filter",
+                "tokentrim.transform.test-filter",
                 {
                     "kind": "transform",
-                    "transform_name": "filter",
+                    "transform_name": "test-filter",
                     "changed": False,
                     "input_items": 1,
                     "output_items": 1,
@@ -356,14 +368,14 @@ def test_identity_processor_persists_openai_export_payloads(isolated_trace_proce
         "handoff",
     ]
     assert traces[0].spans[0].data == {"name": "assistant"}
-    assert traces[0].spans[1].name == "filter"
+    assert traces[0].spans[1].name == "test-filter"
     assert traces[0].spans[1].metrics == {
         "input_tokens": 3,
         "output_tokens": 3,
         "input_items": 1,
         "output_items": 1,
     }
-    assert traces[0].spans[1].data == {"transform_name": "filter", "changed": False}
+    assert traces[0].spans[1].data == {"transform_name": "test-filter", "changed": False}
     assert traces[0].spans[2].metrics == {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
     assert traces[0].spans[3].data == {"name": "lookup", "input": "{}", "output": "done"}
     assert traces[0].spans[4].name == "assistant -> worker"
@@ -414,7 +426,7 @@ def test_tokentrim_openai_run_persists_transform_span_for_pipeline_step(
     client = Tokentrim()
     trace_store = InMemoryTraceStore()
     run_config = client.openai_agents_config(
-        steps=(FilterMessages(),),
+        steps=(TestFilterTransform(),),
         user_id="u1",
         session_id="s1",
         trace_store=trace_store,
@@ -432,8 +444,8 @@ def test_tokentrim_openai_run_persists_transform_span_for_pipeline_step(
     transform_spans = [span for span in traces[0].spans if span.kind == "transform"]
     assert len(transform_spans) == 1
     transform_span = transform_spans[0]
-    assert transform_span.name == "filter"
-    assert transform_span.data == {"transform_name": "filter", "changed": False}
+    assert transform_span.name == "test-filter"
+    assert transform_span.data == {"transform_name": "test-filter", "changed": False}
     assert transform_span.metrics is not None
     assert transform_span.metrics["input_items"] == 1
     assert transform_span.metrics["output_items"] == 1

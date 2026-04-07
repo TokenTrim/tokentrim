@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tokentrim.pipeline.requests import ContextRequest
-from tokentrim.transforms.compaction import (
+from tokentrim.transforms.compaction.microcompact import (
     MicrocompactConfig,
     MicrocompactMessages,
     MicrocompactOrchestrator,

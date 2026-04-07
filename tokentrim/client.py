@@ -113,24 +113,35 @@ class ComposedPipeline:
             raise TokentrimError(
                 "compose(...).apply(...) cannot infer payload kind from an empty list."
             )
-        head = payload[0]
-        if not isinstance(head, dict):
-            raise TokentrimError("compose(...).apply(...) payload entries must be dicts.")
+        saw_message = False
+        saw_tool = False
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise TokentrimError("compose(...).apply(...) payload entries must be dicts.")
+            is_message = (
+                isinstance(entry.get("role"), str) and isinstance(entry.get("content"), str)
+            )
+            is_tool = (
+                isinstance(entry.get("name"), str)
+                and isinstance(entry.get("description"), str)
+                and isinstance(entry.get("input_schema"), dict)
+            )
+            if is_message and not is_tool:
+                saw_message = True
+                continue
+            if is_tool and not is_message:
+                saw_tool = True
+                continue
+            raise TokentrimError(
+                "compose(...).apply(...) payload entries must all be message-shaped or tool-shaped dicts."
+            )
 
-        is_message = (
-            isinstance(head.get("role"), str) and isinstance(head.get("content"), str)
-        )
-        is_tool = (
-            isinstance(head.get("name"), str)
-            and isinstance(head.get("description"), str)
-            and isinstance(head.get("input_schema"), dict)
-        )
-        if is_message and not is_tool:
+        if saw_message and not saw_tool:
             return "context"
-        if is_tool and not is_message:
+        if saw_tool and not saw_message:
             return "tools"
         raise TokentrimError(
-            "compose(...).apply(...) payload kind is ambiguous. Pass steps to disambiguate."
+            "compose(...).apply(...) payload entries must not mix messages and tools in one positional payload."
         )
 
     def to_openai_agents(

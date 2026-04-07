@@ -12,7 +12,8 @@ from agents.handoffs import HandoffInputData
 from agents.run import CallModelData, ModelInputData
 
 from tokentrim import Tokentrim
-from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
+from tokentrim.memory import LocalDirectoryMemoryStore
+from tokentrim.transforms import CompactConversation, RetrieveDurableMemory
 from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.integrations.openai_agents import (
     OpenAIAgentsAdapter,
@@ -20,13 +21,31 @@ from tokentrim.integrations.openai_agents import (
 )
 from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
 from tokentrim.tracing import InMemoryTraceStore
+from tokentrim.transforms.base import Transform
+from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.types.state import PipelineState
 
 
-class InMemoryStore:
-    def retrieve(self, *, user_id: str, session_id: str) -> str | None:
-        if user_id == "u1" and session_id == "s1":
-            return "stored context"
-        return None
+class TestFilterTransform(Transform):
+    @property
+    def name(self) -> str:
+        return "test-filter"
+
+    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+        del request
+        filtered = [message for message in state.context if message["content"].strip()]
+        if not filtered:
+            return PipelineState(context=[], tools=state.tools)
+        result = []
+        for message in filtered:
+            if result and result[-1]["role"] == message["role"] and result[-1]["content"] == message["content"]:
+                result[-1] = {
+                    "role": message["role"],
+                    "content": f"{message['content']} [repeated 2x]",
+                }
+                continue
+            result.append(message)
+        return PipelineState(context=result, tools=state.tools)
 
 
 def _message_items(count: int) -> list[dict[str, str]]:
@@ -77,7 +96,7 @@ def test_openai_agents_adapter_compacts_plain_text_inputs(
 
 def test_openai_agents_adapter_implements_integration_adapter() -> None:
     client = Tokentrim()
-    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(FilterMessages(),)))
+    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(TestFilterTransform(),)))
 
     wrapped = adapter.wrap(client)
 
@@ -122,7 +141,7 @@ def test_openai_agents_adapter_requires_user_and_session_for_trace_store() -> No
 def test_openai_agents_adapter_chains_existing_model_filter() -> None:
     client = Tokentrim()
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(steps=(FilterMessages(),))
+        options=OpenAIAgentsOptions(steps=(TestFilterTransform(),))
     ).wrap(
         client,
         config=RunConfig(
@@ -157,7 +176,7 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
         return [*history_items, {"role": "assistant", "content": "   "}, *new_items]
 
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(steps=(FilterMessages(),))
+        options=OpenAIAgentsOptions(steps=(TestFilterTransform(),))
     ).wrap(
         client,
         config=RunConfig(session_input_callback=session_callback),
@@ -176,13 +195,15 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
     ]
 
 
-def test_openai_agents_adapter_applies_rlm_to_handoff_history() -> None:
+def test_openai_agents_adapter_applies_durable_memory_to_handoff_history(tmp_path) -> None:
     client = Tokentrim()
+    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
+    store.remember(user_id="u1", session_id="s1", content="stored context")
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             user_id="u1",
             session_id="s1",
-            steps=(RetrieveMemory(memory_store=InMemoryStore()),),
+            steps=(RetrieveDurableMemory(memory_store=store),),
         )
     ).wrap(client)
     payload = HandoffInputData(
@@ -206,7 +227,7 @@ def test_openai_agents_adapter_preserves_rich_response_items() -> None:
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=1,
-            steps=(FilterMessages(), CompactConversation()),
+            steps=(TestFilterTransform(), CompactConversation()),
         )
     ).wrap(client)
     input_items = [
@@ -236,7 +257,7 @@ def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
     client = Tokentrim()
 
     wrapped = client.wrap_integration(
-        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(FilterMessages(),)))
+        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(TestFilterTransform(),)))
     )
 
     assert isinstance(wrapped, RunConfig)
@@ -246,7 +267,7 @@ def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
 def test_client_openai_agents_config_defaults_to_call_model_hook_only() -> None:
     client = Tokentrim()
 
-    wrapped = client.openai_agents_config(steps=(FilterMessages(),))
+    wrapped = client.openai_agents_config(steps=(TestFilterTransform(),))
 
     assert isinstance(wrapped, RunConfig)
     assert wrapped.call_model_input_filter is not None
@@ -258,7 +279,7 @@ def test_client_openai_agents_config_supports_advanced_opt_in_hooks() -> None:
     client = Tokentrim()
 
     wrapped = client.openai_agents_config(
-        steps=(FilterMessages(),),
+        steps=(TestFilterTransform(),),
         apply_to_session_history=True,
         apply_to_handoffs=True,
     )
@@ -272,7 +293,7 @@ def test_client_openai_agents_config_supports_advanced_opt_in_hooks() -> None:
 def test_compose_to_openai_agents_builds_run_config() -> None:
     client = Tokentrim()
 
-    wrapped = client.compose(FilterMessages()).to_openai_agents(token_budget=100)
+    wrapped = client.compose(TestFilterTransform()).to_openai_agents(token_budget=100)
 
     assert isinstance(wrapped, RunConfig)
     assert wrapped.call_model_input_filter is not None
