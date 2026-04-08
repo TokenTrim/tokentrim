@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from tokentrim.transforms.compaction.config import ContextEditConfig
 from tokentrim.transforms.compaction.context_edit import ContextEditor
+from tokentrim.transforms.compaction.types import ContextEditMessageGroup
 
 
 def test_context_editor_drops_old_resolved_tool_rounds() -> None:
@@ -89,3 +91,65 @@ def test_context_editor_keeps_old_unresolved_error_when_recent_turn_is_fluff() -
     content = "\n".join(message["content"] for message in result)
 
     assert "FileNotFoundError: missing fixture" in content
+
+
+def test_context_editor_private_branches_for_protection_pairing_and_artifacts() -> None:
+    editor = ContextEditor(config=ContextEditConfig(collapse_repeated_assistant_plans=True))
+
+    protected_group = ContextEditMessageGroup(
+        messages=({"role": "system", "content": "system"},),
+        kind="protected",
+    )
+    assert editor._drop_reason(
+        protected_group,
+        group_index=0,
+        latest_tool_index=None,
+        saw_later_success=False,
+        kept_recent_plan=False,
+    ) is None
+
+    tool_call_group = ContextEditMessageGroup(
+        messages=(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "function": {"name": "search", "arguments": "{}"}}],
+            },
+        ),
+        kind="message",
+    )
+    assert editor._drop_reason(
+        tool_call_group,
+        group_index=0,
+        latest_tool_index=None,
+        saw_later_success=False,
+        kept_recent_plan=False,
+    ) is None
+
+    plan_group = ContextEditMessageGroup(
+        messages=({"role": "assistant", "content": "I'll inspect this next."},),
+        kind="assistant_plan",
+    )
+    assert editor._drop_reason(
+        plan_group,
+        group_index=0,
+        latest_tool_index=None,
+        saw_later_success=False,
+        kept_recent_plan=True,
+    ) == "assistant_plan"
+
+    assert editor._build_groups(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "continue"},
+        ]
+    )[0].kind == "protected"
+
+    assert editor._should_pair(
+        {"role": "user", "content": "[exit_code] 1"},
+        {"role": "assistant", "content": "reply"},
+    )
+    assert not editor._should_pair(
+        {"role": "assistant", "content": "plan"},
+        {"role": "system", "content": "system"},
+    )

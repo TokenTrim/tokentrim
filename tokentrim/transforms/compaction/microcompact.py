@@ -1,83 +1,59 @@
+"""Microcompact transform for deterministic message compression.
+
+This module provides a fast, deterministic compression pass that runs before
+LLM-backed summarization. It groups messages by age and type, then compresses
+older groups into compact system messages preserving key artifacts.
+
+Supports multimodal messages by safely extracting text content and preserving
+image references in the compacted output.
+
+Integrates salience scoring to preserve high-value content (errors, constraints,
+commands) even when it would otherwise be compressed.
+"""
+
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
-from typing import Final, Literal
 
 from tokentrim.core.token_counting import count_message_tokens
 from tokentrim.pipeline.requests import PipelineRequest
+from tokentrim.salience import score_text_salience
 from tokentrim.transforms.base import Transform
-from tokentrim.types.message import Message
-from tokentrim.types.state import PipelineState
-
-MICROCOMPACT_PREFIX: Final[str] = "[microcompact]"
-SUMMARY_SYSTEM_PREFIX: Final[str] = "History only."
-DEFAULT_MIN_CONTENT_CHARS: Final[int] = 280
-DEFAULT_RECENT_GROUPS_TO_KEEP: Final[int] = 2
-DEFAULT_RECENT_TOOL_GROUPS_TO_KEEP: Final[int] = 0
-DEFAULT_MATURE_GROUP_AGE: Final[int] = 4
-DEFAULT_MAX_COMMANDS: Final[int] = 2
-DEFAULT_MAX_ERRORS: Final[int] = 2
-DEFAULT_MAX_ARTIFACTS: Final[int] = 4
-DEFAULT_TEXT_SNIPPET_CHARS: Final[int] = 96
-DEFAULT_MIN_MESSAGES: Final[int] = 2
-DEFAULT_MIN_TOKENS_SAVED: Final[int] = 1
-DEFAULT_AGGRESSIVE_MIN_CONTENT_CHARS: Final[int] = 120
-DEFAULT_AGGRESSIVE_RECENT_GROUPS_TO_KEEP: Final[int] = 1
-
-_COMMAND_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^\$\s+(.+)$")
-_EXIT_CODE_RE: Final[re.Pattern[str]] = re.compile(r"(?im)\[exit_code\]\s+(\d+)")
-_ERROR_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?im)^.*(?:error|exception|traceback|failed|failure|enoent|permission denied).*$"
+from tokentrim.transforms.compaction.config import (
+    MICROCOMPACT_PREFIX,
+    SUMMARY_SYSTEM_PREFIX,
+    MicrocompactConfig,
 )
-_PATH_RE: Final[re.Pattern[str]] = re.compile(r"(?:^|[\s(])((?:~|/|\.\.?/)[^\s:;,)\]]+)")
-_BACKTICK_RE: Final[re.Pattern[str]] = re.compile(r"`([^`\n]+)`")
-_WHITESPACE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
-
-AgeBand = Literal["recent", "old", "mature"]
-GroupKind = Literal["tool_round", "dialogue_round", "single", "protected"]
-MicrocompactPressure = Literal["normal", "high"]
-
-
-@dataclass(frozen=True, slots=True)
-class MicrocompactConfig:
-    min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS
-    recent_groups_to_keep: int = DEFAULT_RECENT_GROUPS_TO_KEEP
-    recent_tool_groups_to_keep: int = DEFAULT_RECENT_TOOL_GROUPS_TO_KEEP
-    mature_group_age: int = DEFAULT_MATURE_GROUP_AGE
-    max_commands: int = DEFAULT_MAX_COMMANDS
-    max_errors: int = DEFAULT_MAX_ERRORS
-    max_artifacts: int = DEFAULT_MAX_ARTIFACTS
-    text_snippet_chars: int = DEFAULT_TEXT_SNIPPET_CHARS
-    min_messages: int = DEFAULT_MIN_MESSAGES
-    min_tokens_saved: int = DEFAULT_MIN_TOKENS_SAVED
-    aggressive_min_content_chars: int = DEFAULT_AGGRESSIVE_MIN_CONTENT_CHARS
-    aggressive_recent_groups_to_keep: int = DEFAULT_AGGRESSIVE_RECENT_GROUPS_TO_KEEP
-
-
-@dataclass(frozen=True, slots=True)
-class MessageGroup:
-    messages: tuple[Message, ...]
-    kind: GroupKind
-    age_band: AgeBand
-    token_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class MicrocompactPlan:
-    messages: list[Message]
-    original_tokens: int
-    compacted_tokens: int
-    groups_seen: int
-    groups_compacted: int
-
-    @property
-    def tokens_saved(self) -> int:
-        return self.original_tokens - self.compacted_tokens
+from tokentrim.transforms.compaction.patterns import (
+    BACKTICK_RE,
+    COMMAND_RE,
+    ERROR_RE,
+    EXIT_CODE_RE,
+    PATH_RE,
+    WHITESPACE_RE,
+)
+from tokentrim.transforms.compaction.types import (
+    AgeBand,
+    GroupKind,
+    MessageGroup,
+    MicrocompactPlan,
+    MicrocompactPressure,
+)
+from tokentrim.types.message import (
+    Message,
+    extract_image_refs,
+    get_text_content,
+    has_images,
+    has_tool_calls,
+    is_tool_result,
+)
+from tokentrim.types.state import PipelineState
 
 
 @dataclass(frozen=True, slots=True)
 class MicrocompactOrchestrator:
+    """Deterministically compress bulky older groups before summarization."""
+
     config: MicrocompactConfig = MicrocompactConfig()
     tokenizer_model: str | None = None
 
@@ -219,18 +195,28 @@ class MicrocompactOrchestrator:
         current_role = current["role"]
         next_role = next_message["role"]
 
+        # Pair tool calls with their results
+        if has_tool_calls(current) and is_tool_result(next_message):
+            return True
+        # Pair tool results that follow each other (multi-tool case)
+        if is_tool_result(current) and is_tool_result(next_message):
+            return True
+
         if current_role == "assistant" and next_role == "user":
             return True
         if current_role == "user" and next_role == "assistant":
-            if self._looks_like_tool_or_terminal_content(current["content"]):
+            if self._looks_like_tool_or_terminal_content(get_text_content(current)):
                 return True
-            return not self._looks_like_tool_or_terminal_content(next_message["content"])
+            return not self._looks_like_tool_or_terminal_content(get_text_content(next_message))
         return False
 
     def _classify_group(self, messages: tuple[Message, ...]) -> GroupKind:
         if any(self._is_protected_message(message) for message in messages):
             return "protected"
-        if any(self._looks_like_tool_or_terminal_content(message["content"]) for message in messages):
+        # Tool call/result pairs are tool rounds
+        if any(has_tool_calls(message) or is_tool_result(message) for message in messages):
+            return "tool_round"
+        if any(self._looks_like_tool_or_terminal_content(get_text_content(message)) for message in messages):
             return "tool_round"
         if len(messages) == 2:
             return "dialogue_round"
@@ -269,12 +255,24 @@ class MicrocompactOrchestrator:
         if group.kind == "protected":
             return False
 
+        # Check salience score — preserve high-value content
+        if self.config.use_salience_scoring:
+            group_salience = self._compute_group_salience(group)
+            # Under high pressure, still compact if salience is moderate
+            salience_threshold = (
+                self.config.min_salience_to_protect * 2
+                if pressure == "high"
+                else self.config.min_salience_to_protect
+            )
+            if group_salience >= salience_threshold:
+                return False
+
         min_content_chars = (
             self.config.aggressive_min_content_chars
             if pressure == "high"
             else self.config.min_content_chars
         )
-        total_chars = sum(len(message["content"]) for message in group.messages)
+        total_chars = sum(len(get_text_content(message)) for message in group.messages)
 
         if group.kind == "tool_round":
             if group.age_band == "recent":
@@ -287,11 +285,26 @@ class MicrocompactOrchestrator:
             return total_chars >= min_content_chars
         return False
 
+    def _compute_group_salience(self, group: MessageGroup) -> int:
+        """Compute aggregate salience score for a message group.
+
+        Higher scores indicate more important content that should be preserved.
+        """
+        total_salience = 0
+        for i, message in enumerate(group.messages):
+            content = get_text_content(message)
+            # Use recency_rank based on position in group
+            score = score_text_salience(content, recency_rank=len(group.messages) - i)
+            total_salience = max(total_salience, score)
+        return total_salience
+
     def _compact_group(self, group: MessageGroup) -> Message:
         commands = self._extract_commands(group.messages)
         exit_codes = self._extract_exit_codes(group.messages)
         errors = self._extract_errors(group.messages)
         artifacts = self._extract_artifacts(group.messages)
+        images = self._extract_images(group.messages)
+        tool_calls = self._extract_tool_call_info(group.messages)
         snippet = self._extract_text_snippet(group.messages)
 
         parts = [MICROCOMPACT_PREFIX, f"kind={group.kind}", f"age={group.age_band}"]
@@ -303,8 +316,12 @@ class MicrocompactOrchestrator:
             parts.append("errors=" + " | ".join(errors[: self.config.max_errors]))
         if artifacts:
             parts.append("artifacts=" + " | ".join(artifacts[: self.config.max_artifacts]))
+        if images:
+            parts.append("images=" + " | ".join(images))
+        if tool_calls:
+            parts.append("tools=" + " | ".join(tool_calls))
         if snippet and (
-            group.kind != "tool_round" or (not commands and not errors and not artifacts)
+            group.kind != "tool_round" or (not commands and not errors and not artifacts and not tool_calls)
         ):
             parts.append("snippet=" + snippet)
 
@@ -313,19 +330,22 @@ class MicrocompactOrchestrator:
     def _extract_commands(self, messages: tuple[Message, ...]) -> list[str]:
         commands: list[str] = []
         for message in messages:
-            commands.extend(match.group(1).strip() for match in _COMMAND_RE.finditer(message["content"]))
+            content = get_text_content(message)
+            commands.extend(match.group(1).strip() for match in COMMAND_RE.finditer(content))
         return self._dedupe(commands)
 
     def _extract_exit_codes(self, messages: tuple[Message, ...]) -> list[str]:
         codes: list[str] = []
         for message in messages:
-            codes.extend(match.group(1) for match in _EXIT_CODE_RE.finditer(message["content"]))
+            content = get_text_content(message)
+            codes.extend(match.group(1) for match in EXIT_CODE_RE.finditer(content))
         return self._dedupe(codes)
 
     def _extract_errors(self, messages: tuple[Message, ...]) -> list[str]:
         errors: list[str] = []
         for message in messages:
-            errors.extend(self._normalize_line(match.group(0)) for match in _ERROR_RE.finditer(message["content"]))
+            content = get_text_content(message)
+            errors.extend(self._normalize_line(match.group(0)) for match in ERROR_RE.finditer(content))
         deduped = self._dedupe(errors)
         specific_errors = [
             error
@@ -339,21 +359,61 @@ class MicrocompactOrchestrator:
     def _extract_artifacts(self, messages: tuple[Message, ...]) -> list[str]:
         artifacts: list[str] = []
         for message in messages:
-            content = message["content"]
-            artifacts.extend(match.group(1).strip("()[]{}.,:;") for match in _PATH_RE.finditer(content))
-            artifacts.extend(match.group(1).strip("()[]{}.,:;") for match in _BACKTICK_RE.finditer(content))
+            content = get_text_content(message)
+            artifacts.extend(match.group(1).strip("()[]{}.,:;") for match in PATH_RE.finditer(content))
+            artifacts.extend(match.group(1).strip("()[]{}.,:;") for match in BACKTICK_RE.finditer(content))
         return self._dedupe(artifacts)
+
+    def _extract_images(self, messages: tuple[Message, ...]) -> list[str]:
+        """Extract image references from multimodal messages."""
+        images: list[str] = []
+        for message in messages:
+            images.extend(extract_image_refs(message))
+        return self._dedupe(images)
+
+    def _extract_tool_call_info(self, messages: tuple[Message, ...]) -> list[str]:
+        """Extract tool call names and IDs from messages.
+
+        Returns a list like: ["get_weather(id=call_123)", "search(id=call_456)"]
+        """
+        tool_info: list[str] = []
+        for message in messages:
+            # Extract from tool_calls array (assistant making calls)
+            tool_calls = message.get("tool_calls", [])
+            for tool_call in tool_calls:
+                if isinstance(tool_call, dict):
+                    func = tool_call.get("function", {})
+                    name = func.get("name", "unknown")
+                    call_id = tool_call.get("id", "")
+                    if call_id:
+                        tool_info.append(f"{name}(id={call_id})")
+                    else:
+                        tool_info.append(name)
+
+            # Extract from tool result messages
+            if is_tool_result(message):
+                name = message.get("name", "")
+                call_id = message.get("tool_call_id", "")
+                if name:
+                    if call_id:
+                        tool_info.append(f"{name}→result(id={call_id})")
+                    else:
+                        tool_info.append(f"{name}→result")
+
+        return self._dedupe(tool_info)
 
     def _extract_text_snippet(self, messages: tuple[Message, ...]) -> str:
         lines: list[str] = []
         for message in messages:
-            for line in message["content"].splitlines():
+            content = get_text_content(message)
+            for line in content.splitlines():
+                raw_stripped = line.strip()
+                if raw_stripped.startswith("[") and raw_stripped.endswith("]"):
+                    continue
                 normalized = self._normalize_line(line)
                 if not normalized:
                     continue
                 if normalized.startswith("$ "):
-                    continue
-                if normalized.startswith("[") and normalized.endswith("]"):
                     continue
                 lines.append(normalized)
         if not lines:
@@ -382,11 +442,11 @@ class MicrocompactOrchestrator:
     def _is_protected_message(self, message: Message) -> bool:
         if message["role"] == "system":
             return True
-        content = message["content"]
+        content = get_text_content(message)
         return content.startswith(MICROCOMPACT_PREFIX) or content.startswith(SUMMARY_SYSTEM_PREFIX)
 
     def _normalize_line(self, line: str) -> str:
-        return _WHITESPACE_RE.sub(" ", line).strip().strip("()[]{}.,:;")
+        return WHITESPACE_RE.sub(" ", line).strip().strip("()[]{}.,:;")
 
     def _dedupe(self, values: list[str]) -> list[str]:
         seen: set[str] = set()

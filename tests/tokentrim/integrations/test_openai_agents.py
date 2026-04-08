@@ -12,8 +12,7 @@ from agents.handoffs import HandoffInputData
 from agents.run import CallModelData, ModelInputData
 
 from tokentrim import Tokentrim
-from tokentrim.memory import LocalDirectoryMemoryStore
-from tokentrim.transforms import CompactConversation, RetrieveDurableMemory
+from tokentrim.transforms import CompactConversation
 from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.integrations.openai_agents import (
     OpenAIAgentsAdapter,
@@ -193,33 +192,6 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
         {"role": "user", "content": "ping"},
         {"role": "assistant", "content": "pong"},
     ]
-
-
-def test_openai_agents_adapter_applies_durable_memory_to_handoff_history(tmp_path) -> None:
-    client = Tokentrim()
-    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
-    store.remember(user_id="u1", session_id="s1", content="stored context")
-    wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(
-            user_id="u1",
-            session_id="s1",
-            steps=(RetrieveDurableMemory(memory_store=store),),
-        )
-    ).wrap(client)
-    payload = HandoffInputData(
-        input_history="hello",
-        pre_handoff_items=(),
-        new_items=(),
-    )
-
-    result = asyncio.run(wrapped.handoff_input_filter(payload))
-
-    assert result.input_history == (
-        {"role": "system", "content": "stored context"},
-        {"role": "user", "content": "hello"},
-    )
-    assert result.pre_handoff_items == ()
-    assert result.new_items == ()
 
 
 def test_openai_agents_adapter_preserves_rich_response_items() -> None:

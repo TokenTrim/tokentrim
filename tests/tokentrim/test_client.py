@@ -10,14 +10,13 @@ import tokentrim.tracing as tracing_module
 from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
-from tokentrim.memory import LocalDirectoryMemoryStore
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.tracing import InMemoryTraceStore, PipelineSpan, PipelineTracer
 from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.tool import Tool
 from tokentrim.types.trace import Trace
-from tokentrim.transforms import CompactConversation, RetrieveDurableMemory
+from tokentrim.transforms import CompactConversation
 from tokentrim.transforms.base import Transform
 
 
@@ -186,23 +185,6 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
     assert captured["pipeline_tracer"] is pipeline_tracer
 
 
-def test_durable_memory_store_belongs_to_memory_transform(tmp_path) -> None:
-    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
-    store.remember(user_id="u1", session_id="s1", content="stored context about hello")
-    client = Tokentrim()
-    messages = [{"role": "user", "content": "hello"}]
-
-    result = client.compose(RetrieveDurableMemory(memory_store=store)).apply(
-        messages,
-        user_id="u1",
-        session_id="s1",
-    )
-
-    assert result.context[0]["role"] == "system"
-    assert "Durable memory only." in result.context[0]["content"]
-    assert "stored context about hello" in result.context[0]["content"]
-
-
 def test_constructor_does_not_define_per_transform_models() -> None:
     client = Tokentrim(tokenizer="shared-model")
 
@@ -260,8 +242,6 @@ def test_public_tracing_exports_use_canonical_names() -> None:
 
 def test_public_top_level_exports_include_primary_transforms() -> None:
     assert hasattr(tokentrim_module, "CompactConversation")
-    assert hasattr(tokentrim_module, "RetrieveDurableMemory")
-    assert hasattr(tokentrim_module, "RememberDurableMemory")
 
 
 def test_compose_apply_returns_frozen_result_objects() -> None:
@@ -323,13 +303,10 @@ def test_unified_pipeline_records_transform_span_errors() -> None:
     assert pipeline_tracer.spans[0].error == "RuntimeError"
 
 
-def test_compose_apply_context_wires_compaction_and_memory(
+def test_compose_apply_context_wires_compaction(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
 ) -> None:
     client = Tokentrim()
-    store = LocalDirectoryMemoryStore(root_dir=tmp_path / "memory")
-    store.remember(user_id="u1", session_id="s1", content="stored context about issue-five")
     messages = [
         {"role": "user", "content": "old-a " * 20},
         {"role": "assistant", "content": "old-b " * 20},
@@ -355,11 +332,8 @@ def test_compose_apply_context_wires_compaction_and_memory(
     )
     result = client.compose(
         CompactConversation(model="compact-model"),
-        RetrieveDurableMemory(memory_store=store),
     ).apply(
         messages,
-        user_id="u1",
-        session_id="s1",
         token_budget=200,
     )
 
@@ -367,11 +341,8 @@ def test_compose_apply_context_wires_compaction_and_memory(
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
     assert result.context[0]["role"] == "system"
-    assert result.context[1]["role"] == "system"
     assert "summary" in result.context[0]["content"]
-    assert "Durable memory only." in result.context[1]["content"]
-    assert "stored context about issue-five" in result.context[1]["content"]
-    assert [trace.step_name for trace in result.trace.steps] == ["compaction", "durable_memory"]
+    assert [trace.step_name for trace in result.trace.steps] == ["compaction"]
     assert all(message["content"].strip() for message in result.context)
     assert result.trace.output_tokens > 0
 

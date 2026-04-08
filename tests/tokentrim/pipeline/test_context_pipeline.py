@@ -206,8 +206,6 @@ def test_pipeline_uses_auto_budget_from_compaction_step(monkeypatch: pytest.Monk
                 model="gpt-4o-mini",
                 keep_last=0,
                 context_window=120,
-                reserved_output_tokens=20,
-                auto_compact_buffer_tokens=10,
             ),
         ),
     )
@@ -219,14 +217,14 @@ def test_pipeline_uses_auto_budget_from_compaction_step(monkeypatch: pytest.Monk
 
     result = pipeline.run(request)
 
-    assert result.trace.token_budget == 90
+    assert result.trace.token_budget == 68
     assert result.context[0]["role"] == "system"
 
 
 def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget() -> None:
     pipeline = UnifiedPipeline(tokenizer_model=None)
     request = ContextRequest(
-        messages=({"role": "user", "content": "x" * 120},),
+        messages=({"role": "user", "content": "x" * 400},),
         user_id=None,
         session_id=None,
         token_budget=None,
@@ -235,9 +233,6 @@ def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget(
                 model="gpt-4o-mini",
                 auto_budget=True,
                 context_window=60,
-                reserved_output_tokens=20,
-                auto_compact_buffer_tokens=10,
-                enable_microcompact=False,
             ),
         ),
     )
@@ -245,4 +240,4 @@ def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget(
     with pytest.raises(BudgetExceededError) as exc_info:
         pipeline.run(request)
 
-    assert exc_info.value.budget == 30
+    assert exc_info.value.budget == 34

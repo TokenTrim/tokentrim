@@ -9,9 +9,9 @@ Tokentrim exposes a single compose-first API:
 
 - `Tokentrim(...).compose(*steps).apply(...)`
 
-The v1 wedge is conversation compaction plus durable memory for long-running
-coding and agent workflows. The main promise is simple: preserve the details
-that matter while reducing context size before model execution.
+The v1 wedge is conversation compaction for long-running coding and agent
+workflows. The main promise is simple: preserve the details that matter while
+reducing context size before model execution.
 
 The same runtime supports both payload tracks:
 
@@ -46,10 +46,6 @@ The most common transforms are re-exported from `tokentrim` directly.
 If you are trying Tokentrim for the first time:
 
 1. Start with `CompactConversation` only.
-2. Add `RetrieveDurableMemory` and `RememberDurableMemory` once you have
-   stable `user_id` and `session_id` values in your app.
-3. Add `FileSystemTraceStore` only if you want on-disk trace artifacts under
-   `.tokentrim/traces/`.
 
 ### Hero Path: Context Compaction
 
@@ -86,6 +82,7 @@ from tokentrim import CompactConversation
 step = CompactConversation(
     model="openai/mercury-2",
     keep_last=8,
+    instructions="Preserve exact commands, file paths, and unresolved errors.",
     model_options={
         "api_base": "https://api.inceptionlabs.ai/v1",
         "api_key": os.environ["INCEPTION_API_KEY"],
@@ -93,43 +90,11 @@ step = CompactConversation(
 )
 ```
 
-### Durable Memory
-
-```python
-from tokentrim import CompactConversation, RememberDurableMemory, RetrieveDurableMemory, Tokentrim
-from tokentrim.memory import LocalDirectoryMemoryStore
-
-tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
-memory_store = LocalDirectoryMemoryStore(root_dir=".tokentrim/memory")
-
-result = tt.compose(
-    CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveDurableMemory(memory_store=memory_store),
-    RememberDurableMemory(memory_store=memory_store),
-).apply(
-    context=messages,
-    user_id="user-123",
-    session_id="session-456",
-    task_hint="debug the failing pytest command",
-)
-optimized_messages = result.context
-```
-
-What happens here:
-
-- `RetrieveDurableMemory` reads relevant notes for the current
-  `user_id + session_id` pair and injects them as a system message.
-- `RememberDurableMemory` can persist new notes from the same run, such as
-  explicit "remember this" instructions, checkpoints, or active errors.
-- Memory does not write anything unless you include a write step like
-  `RememberDurableMemory`.
-
 ### Planned Transforms
 
-The earlier `filter`, `compress_tools`, and `create_tools` transforms were only
-exploratory sketches and are intentionally not shipped in the public package.
-They are still part of the product plan, but they need real design and
-benchmark validation before returning as supported APIs.
+The earlier `filter`, `compress_tools`, `create_tools`, and memory-oriented
+experiments were exploratory only. They are intentionally not shipped in the
+public package on this branch.
 
 Planned future areas:
 
@@ -159,24 +124,11 @@ messages: a deterministic working-state block for the current goal, active
 files, latest command, active error, constraints, and next step; then the
 compacted history block for older context.
 
-The compacted history block is also schema-shaped now. It uses stable sections
-for `Goal`, `Active State`, `Critical Artifacts`, `Open Risks`, `Next Step`,
-and `Older Context` so downstream agents do not have to recover structure from
-freeform summaries.
-
-For longer-running sessions, you can also add a separate durable-memory step.
-`RetrieveDurableMemory` reads a local durable-memory store, `.tokentrim/memory`
-by default, and injects only the most relevant saved notes after the leading
-system messages. The store keeps an `index.jsonl` for retrieval and markdown
-entry files under `entries/` so the saved memory is inspectable and editable.
-
-`RememberDurableMemory` is the write-side companion. It can persist explicit
-"remember this" notes, working-state checkpoints, and active-error snapshots
-for the current `user_id + session_id` scope.
-
-If a `trace_store` is also attached to the run, the default write policy can
-extract rule-based memory candidates from prior traces too, for example
-repeated failures or later resolutions of repeated failures.
+The default compaction prompt asks the model for a structured engineering
+handoff with sections such as `Goal`, `Active State`, `Critical Artifacts`,
+`Open Risks`, `Next Step`, and `Older Context`. Tokentrim preserves that prompt
+shape by default, but the returned compacted history is ultimately the model's
+output after deterministic preprocessing, not a runtime-enforced schema.
 
 For simple usage, automatic mode is usually the right choice:
 
@@ -196,48 +148,96 @@ when to compact and for the pipeline's final hard budget enforcement.
 
 If you need explicit control, `CompactConversation` also accepts:
 
+- `strategy="balanced" | "aggressive" | "minimal"`
+- `instructions=...`
 - `context_window=...`
-- `reserved_output_tokens=...`
-- `auto_compact_buffer_tokens=...`
 - `auto_budget=False`
 
 `CompactConversation` also accepts `model_options` for provider-specific
 LiteLLM arguments such as `api_base`, `api_key`, or similar completion
 settings.
 
+Use `instructions` when you want to override the default compaction prompt.
+Use `strategy` to choose how aggressively deterministic pruning and
+microcompaction should compress older context. The default is `balanced`.
+
+## Live Compaction Tests
+
+Tokentrim includes an opt-in live stress test for `CompactConversation` at:
+
+- `tests/tokentrim/transforms/compaction/test_live_stress.py`
+
+This test calls a real model through LiteLLM, measures elapsed time and token
+compression, and writes readable artifacts under
+`tests/artifacts/test_live_compaction_stress_round_trip/`.
+
+The artifact directory contains:
+
+- `before.txt`: the original conversation before compaction
+- `after.txt`: the final compacted conversation
+- `metrics.txt`: model, elapsed time, token counts, and compression rate
+
+### Setup
+
+Copy `.env.test.example` to `.env.test`:
+
+```bash
+cp .env.test.example .env.test
+```
+
+Then fill in one provider configuration.
+
+GPT example:
+
+```bash
+TOKENTRIM_LIVE_COMPACTION=1
+TOKENTRIM_TEST_MODEL=gpt-4o-mini
+TOKENTRIM_TEST_API_KEY=sk-...
+TOKENTRIM_TEST_API_BASE=https://api.openai.com/v1
+```
+
+Mercury example:
+
+```bash
+TOKENTRIM_LIVE_COMPACTION=1
+TOKENTRIM_TEST_MODEL=openai/mercury-2
+TOKENTRIM_TEST_API_KEY=your_mercury_key
+TOKENTRIM_TEST_API_BASE=https://api.inceptionlabs.ai/v1
+```
+
+### Run
+
+From the repo root:
+
+```bash
+PYTHONPATH=. pytest --no-cov tests/tokentrim/transforms/compaction/test_live_stress.py -q -s
+```
+
+Use `-s` so pytest shows the final summary line with:
+
+- model
+- elapsed time
+- tokens before compaction
+- tokens after compaction
+- tokens saved
+- compression percentage
+- artifact directory path
+
+You can also run all non-live tests normally:
+
+```bash
+PYTHONPATH=. pytest -q -m "not live"
+```
+
+### CI Behavior
+
+GitHub Actions does not run live tests. The workflow excludes the `live`
+pytest marker explicitly and also sets `TOKENTRIM_LIVE_COMPACTION=0`.
+
 ## On-Disk Layout
 
-Tokentrim only creates on-disk artifacts if you opt into filesystem-backed
-memory or tracing.
-
-Durable memory with `LocalDirectoryMemoryStore`:
-
-```text
-.tokentrim/
-  memory/
-    users/<user_id>/sessions/<session_id>/
-      index.jsonl
-      entries/
-        <timestamp>_<entry_id>.md
-```
-
-Stored traces with `FileSystemTraceStore`:
-
-```text
-.tokentrim/
-  traces/
-    users/<user_id>/sessions/<session_id>/
-      <timestamp>_<trace_id>.atif.json
-```
-
-When files are written:
-
-- memory markdown files are written only when `RememberDurableMemory` runs and
-  produces a new durable-memory candidate
-- trace files are written only when you attach a `FileSystemTraceStore`
-- compaction itself does not create files
-
-If you only use `CompactConversation`, Tokentrim stays entirely in-memory.
+Compaction itself does not create files. If you only use
+`CompactConversation`, Tokentrim stays entirely in-memory.
 
 ## Transform Contract
 
@@ -271,7 +271,6 @@ It is not the same as the persisted identity trace store used by integrations.
 Tokentrim also supports persisted canonical trace history through:
 
 - `TraceStore`
-- `FileSystemTraceStore`
 - `InMemoryTraceStore`
 - `TokentrimTraceRecord`
 - `TokentrimSpanRecord`
@@ -284,17 +283,12 @@ scoped by `user_id + session_id` and include canonicalized span records for:
 
 Stored traces are additive. They do not replace `result.trace`.
 
-If you want on-disk trajectory files, use `FileSystemTraceStore`. Completed
-traces are written under `.tokentrim/traces/...` as ATIF-shaped JSON with the
-canonical Tokentrim trace embedded in `extra` metadata for round-trip loading.
-
 ## Package Map
 
 - `tokentrim/client.py`: `Tokentrim` facade + composed pipeline API
 - `tokentrim/pipeline/`: requests + unified pipeline runtime
 - `tokentrim/tracing/`: canonical persisted trace records, stores, and pipeline tracer interfaces
-- `tokentrim/transforms/`: pipeline steps (`compaction`, durable-memory retrieval, durable-memory writing)
-- `tokentrim/memory/`: durable-memory stores and retrieval utilities
+- `tokentrim/transforms/`: pipeline steps (`compaction`)
 - `tokentrim/core/`: shared helpers (`copy_utils`, `token_counting`, `llm_client`)
 - `tokentrim/types/`: payload/result/trace datatypes
 - `tokentrim/integrations/`: adapter boundary + OpenAI Agents integration

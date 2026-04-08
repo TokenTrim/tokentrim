@@ -37,3 +37,6 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests/tokentrim"]
 addopts = "--cov=tokentrim --cov-report=term-missing --cov-report=term --cov-fail-under=80"
+markers = [
+    "live: opt-in tests that call real model providers and require local credentials",
+]

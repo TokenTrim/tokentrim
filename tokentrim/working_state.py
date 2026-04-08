@@ -5,7 +5,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from tokentrim.types.message import Message
+from tokentrim.types.message import Message, get_text_content
 
 _WHITESPACE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _ABSOLUTE_PATH_RE: Final[re.Pattern[str]] = re.compile(
@@ -100,7 +100,7 @@ def render_working_state_message(state: WorkingState) -> Message | None:
 def parse_working_state_message(message: Message) -> WorkingState | None:
     if message["role"] != "system":
         return None
-    content = message["content"]
+    content = get_text_content(message)
     if not content.startswith(WORKING_STATE_PREFIX):
         return None
     parsed: dict[str, str] = {}
@@ -132,7 +132,7 @@ def _extract_goal(messages: Sequence[Message]) -> str | None:
     for message in reversed(messages):
         if message["role"] != "user":
             continue
-        candidate = _normalize_text(message["content"])
+        candidate = _normalize_text(get_text_content(message))
         if candidate and _looks_task_oriented(candidate):
             return _truncate_line(candidate)
     return None
@@ -142,7 +142,7 @@ def _extract_current_step(messages: Sequence[Message]) -> str | None:
     for message in reversed(messages):
         if message["role"] != "assistant":
             continue
-        candidate = _normalize_text(message["content"])
+        candidate = _normalize_text(get_text_content(message))
         if candidate and _NEXT_STEP_RE.search(candidate):
             return _truncate_line(candidate)
     return None
@@ -152,8 +152,8 @@ def _extract_active_files(messages: Sequence[Message]) -> tuple[str, ...]:
     seen: set[str] = set()
     files: list[str] = []
     for message in reversed(messages):
-        for candidate in _extract_paths(message["content"]):
-            normalized = candidate.strip()
+        for candidate in _extract_paths(get_text_content(message)):
+            normalized = _normalize_path(candidate)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
@@ -165,14 +165,15 @@ def _extract_active_files(messages: Sequence[Message]) -> tuple[str, ...]:
 
 def _extract_latest_command(messages: Sequence[Message]) -> str | None:
     for message in reversed(messages):
-        lines = list(_iter_nonempty_lines(message["content"]))
+        content = get_text_content(message)
+        lines = list(_iter_nonempty_lines(content))
         for line in reversed(lines):
             stripped = line.strip()
             if stripped.startswith("$ "):
                 return _truncate_line(stripped[2:].strip())
             if _looks_like_command(stripped):
                 return _truncate_line(stripped)
-        for candidate in reversed(tuple(_BACKTICK_CODE_RE.findall(message["content"]))):
+        for candidate in reversed(tuple(_BACKTICK_CODE_RE.findall(content))):
             normalized = _normalize_text(candidate)
             if _looks_like_command(normalized):
                 return _truncate_line(normalized)
@@ -182,7 +183,7 @@ def _extract_latest_command(messages: Sequence[Message]) -> str | None:
 def _extract_active_error(messages: Sequence[Message]) -> str | None:
     saw_later_success = False
     for message in reversed(messages):
-        lines = list(_iter_nonempty_lines(message["content"]))
+        lines = list(_iter_nonempty_lines(get_text_content(message)))
         for line in reversed(lines):
             stripped = line.strip()
             if _SUCCESS_LINE_RE.search(stripped):
@@ -198,7 +199,7 @@ def _extract_constraints(messages: Sequence[Message]) -> tuple[str, ...]:
     for message in reversed(messages):
         if message["role"] != "user":
             continue
-        for line in _iter_nonempty_lines(message["content"]):
+        for line in _iter_nonempty_lines(get_text_content(message)):
             normalized = _normalize_text(line)
             if not normalized or not _CONSTRAINT_RE.search(normalized):
                 continue
@@ -213,7 +214,7 @@ def _extract_constraints(messages: Sequence[Message]) -> tuple[str, ...]:
 
 def _extract_next_step(messages: Sequence[Message]) -> str | None:
     for message in reversed(messages):
-        candidate = _normalize_text(message["content"])
+        candidate = _normalize_text(get_text_content(message))
         if candidate and _NEXT_STEP_RE.search(candidate):
             return _truncate_line(candidate)
     return None
@@ -221,11 +222,11 @@ def _extract_next_step(messages: Sequence[Message]) -> str | None:
 
 def _extract_paths(content: str) -> Iterable[str]:
     for match in _ABSOLUTE_PATH_RE.finditer(content):
-        yield match.group(1)
+        yield _normalize_path(match.group(1))
     for match in _RELATIVE_PATH_RE.finditer(content):
-        yield match.group(1)
+        yield _normalize_path(match.group(1))
     for candidate in _BACKTICK_CODE_RE.findall(content):
-        normalized = candidate.strip()
+        normalized = _normalize_path(candidate)
         if "/" in normalized or normalized.endswith((".py", ".md", ".json", ".yaml", ".yml", ".txt")):
             yield normalized
 
@@ -249,6 +250,13 @@ def _looks_like_command(text: str) -> bool:
 
 def _normalize_text(value: str) -> str:
     return _WHITESPACE_RE.sub(" ", value).strip()
+
+
+def _normalize_path(value: str) -> str:
+    normalized = _normalize_text(value)
+    while normalized and normalized[-1] in ".,:;)]}":
+        normalized = normalized[:-1]
+    return normalized
 
 
 def _truncate_line(value: str) -> str:

@@ -1,3 +1,9 @@
+"""Custom exception classes for compaction transform errors.
+
+This module defines a hierarchy of exceptions for different compaction
+failure modes: configuration errors and execution errors.
+"""
+
 from tokentrim.errors.base import TokentrimError
 
 
@@ -11,7 +17,3 @@ class CompactionConfigurationError(CompactionError):
 
 class CompactionExecutionError(CompactionError):
     """Raised when compaction generation fails unexpectedly."""
-
-
-class CompactionOutputError(CompactionError):
-    """Raised when compaction output is unsafe or structurally invalid."""
