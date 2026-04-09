@@ -20,6 +20,7 @@ class CompactConversation(Transform):
 
     model: str | None = None
     keep_last: int = 6
+    reserve_tokens: int = 0
     tokenizer_model: str | None = None
 
     @property
@@ -42,11 +43,14 @@ class CompactConversation(Transform):
         messages = state.context
         if self.keep_last < 1:
             raise CompactionConfigurationError("Compaction keep_last must be at least 1.")
+        if self.reserve_tokens < 0:
+            raise CompactionConfigurationError("Compaction reserve_tokens must be at least 0.")
         if request.token_budget is None:
             return state
         if len(messages) <= self.keep_last:
             return state
-        if count_message_tokens(messages, self.tokenizer_model) <= request.token_budget:
+        target_budget = max(0, request.token_budget - self.reserve_tokens)
+        if count_message_tokens(messages, self.tokenizer_model) <= target_budget:
             return state
         if not self.model:
             raise CompactionConfigurationError(

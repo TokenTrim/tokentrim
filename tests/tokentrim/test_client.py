@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
 
 import pytest
 import tokentrim as tokentrim_module
@@ -51,22 +50,34 @@ def _seed_trace_store() -> InMemoryTraceStore:
 
 
 def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
-    class FakeRLM:
-        def __init__(self, **kwargs):
-            del kwargs
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            model,
+            backend,
+            max_iterations,
+            tokenizer_model,
+            max_depth,
+            max_subcalls,
+            subcall_model,
+        ):
+            del model
+            del backend
+            del max_iterations
+            del tokenizer_model
+            del max_depth
+            del max_subcalls
+            del subcall_model
+            self.trajectory = {"iterations": [{"response": response}]}
 
-        def completion(self, prompt, root_prompt=None):
+        def run(self, prompt, root_prompt=None, system_prompt=None):
             del prompt
             del root_prompt
-            return SimpleNamespace(response=response)
+            del system_prompt
+            return response
 
-        def close(self):
-            return None
-
-    monkeypatch.setattr(
-        "tokentrim.transforms.rlm.transform.import_module",
-        lambda name: SimpleNamespace(RLM=FakeRLM),
-    )
+    monkeypatch.setattr("tokentrim.transforms.rlm.transform.LocalRLMRuntime", FakeRuntime)
 
 
 class EchoAdapter(IntegrationAdapter[str]):
@@ -202,18 +213,21 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
 def test_rlm_store_belongs_to_rlm_transform(monkeypatch: pytest.MonkeyPatch) -> None:
     trace_store = _seed_trace_store()
     client = Tokentrim()
-    messages = [{"role": "user", "content": "hello"}]
-    _install_fake_rlm(monkeypatch, response="stored context")
+    messages = [{"role": "user", "content": "hello " * 40}]
+    _install_fake_rlm(monkeypatch, response="ctx")
 
     result = client.compose(RetrieveMemory(model="memory-model")).apply(
         messages,
         user_id="u1",
         session_id="s1",
-        token_budget=10,
+        token_budget=200,
         trace_store=trace_store,
     )
 
-    assert result.context[0] == {"role": "system", "content": "stored context"}
+    assert result.context == (
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+        {"role": "user", "content": "hello " * 40},
+    )
 
 
 def test_constructor_does_not_define_per_transform_models() -> None:
@@ -350,7 +364,7 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
-    _install_fake_rlm(monkeypatch, response="stored context")
+    _install_fake_rlm(monkeypatch, response="ctx")
     result = client.compose(
         FilterMessages(),
         CompactConversation(model="compact-model"),
@@ -359,15 +373,21 @@ def test_compose_apply_context_wires_filter_compaction_and_rlm(
         messages,
         user_id="u1",
         session_id="s1",
-        token_budget=30,
+        token_budget=40,
         trace_store=_seed_trace_store(),
     )
 
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
-    assert result.context[0] == {"role": "system", "content": "stored context"}
-    assert result.context[1] == {"role": "system", "content": "summary"}
+    assert result.context[:2] == (
+        {"role": "system", "content": "summary"},
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+    )
+    assert result.context[-2:] == (
+        {"role": "user", "content": "5"},
+        {"role": "assistant", "content": "6"},
+    )
     assert [trace.step_name for trace in result.trace.steps] == [
         "filter",
         "compaction",

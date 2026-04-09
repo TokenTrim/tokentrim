@@ -30,7 +30,6 @@ openai-agents = [
     "openai-agents>=0.6.4",
 ]
 rlm = [
-    "rlms>=0.1.1",
 ]
 
 [build-system]

@@ -27,11 +27,14 @@ If you plan to use the OpenAI Agents integration:
 pip install "tokentrim[openai-agents]"
 ```
 
-If you plan to use recursive memory synthesis:
+If you plan to use the in-repo RLM retrieval runtime:
 
 ```bash
-pip install "tokentrim[rlm]"
+pip install tokentrim
 ```
+
+`tokentrim[rlm]` is still accepted as a compatibility alias, but it is now a
+no-op extra because the barebones local RLM runtime ships in-repo.
 
 For development:
 
@@ -172,31 +175,33 @@ scoped by `user_id + session_id` and include canonicalized span records for:
 - Tokentrim transform spans emitted while a wrapped OpenAI run is active
 
 Stored traces are additive. They do not replace `result.trace`.
-`RetrieveMemory(model=...)` reads this stored trace history and synthesizes one
-scoped system-memory message when relevant traces are available.
+`RetrieveMemory(model=...)` reads this stored trace history and synthesizes an
+additive memory block for the next step when earlier run details are useful.
 
 ## Recursive Memory
 
-`RetrieveMemory(model=...)` is a trace-backed memory enrichment step:
+`RetrieveMemory(model=...)` is a trace-backed multi-step retrieval step:
 
 - it requires `trace_store`, `user_id`, and `session_id`
-- it only runs when a `token_budget` is configured and the current live context plus serialized trace history would exceed that budget
-- it reads recent stored traces for that user/session scope
-- it builds a retrieval prompt from the current task plus live messages
-- it calls the optional external `rlm` runtime to synthesize one short memory block
-- it prepends that memory as a `system` message when synthesis succeeds
+- it runs whenever the transform is enabled and trace scope is available
+- it reads stored traces for that user/session scope as persistent run history
+- it builds a structured `context` object from live messages plus stored traces
+- it uses Tokentrim's in-repo local RLM runtime to browse `context`, inspect slices, grep older history, and issue one depth-1 `rlm_query(...)` subcall over an arbitrary subcontext
+- it injects one retrieved system-memory block ahead of live messages when older history is helpful for the immediate next step
 
 Important behavior:
 
 - it is context-only and does not modify tools
-- it is a no-op when scope is missing, no traces exist, no `token_budget` is set, the combined live context plus trace history already fits in budget, or the synthesized output is blank
-- it currently uses the external runtime in `environment="local"`
-- it raises a transform-specific configuration error if `tokentrim[rlm]` is not installed
+- it is a no-op when scope is missing, no traces exist, or the RLM returns empty output
+- it uses a local in-process REPL loop with `max_depth=1`; that means root retrieval plus one depth-1 recursive subcall, with no deeper recursion or alternate sandboxes
 - it rejects leaked RLM scaffold output such as `FINAL(...)` / `FINAL_VAR(...)` instead of injecting it into context
+- blank output means “no additional memory needed this turn”; it is logged as `no_memory`, not treated as an error
+- retrieved memory is trimmed to `max_memory_tokens`, and if a request budget is active it is also trimmed to remaining headroom or dropped entirely when no space remains
 
-This transform is not a compaction step. It reduces stored historical trace data
-into a smaller memory block, but it usually increases the final live prompt
-because that memory is injected into the current context.
+This transform now behaves like an RLM-backed multi-step retriever. It uses
+stored trace history plus the current live context to decide what the
+agent is most likely doing next, browse the relevant history, and return only
+the additive memory that helps with that immediate next step.
 
 ## Package Map
 
@@ -259,6 +264,6 @@ such as `compaction` when those transforms run inside an active OpenAI trace.
 
 - results are frozen dataclasses
 - message and tool schemas stay intentionally minimal in v0.1
-- `RetrieveMemory` is TraceStore-backed memory synthesis using the optional external `rlm` runtime
-- `RetrieveMemory` enriches live context by prepending one synthesized `system` memory block
+- `RetrieveMemory` now uses Tokentrim's internal local-only RLM runtime for additive-memory synthesis
+- `RetrieveMemory` prepends one bounded retrieved-memory system block instead of replacing live context
 - tool BPE is a deterministic heuristic in v0.1

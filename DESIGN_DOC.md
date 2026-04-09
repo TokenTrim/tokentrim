@@ -59,7 +59,7 @@ Tracing-related public types live under `tokentrim/tracing/`:
 | `tokentrim/transforms/base.py` | Shared transform contract |
 | `tokentrim/transforms/filter/` | Message filtering transform |
 | `tokentrim/transforms/compaction/` | Conversation compaction transform |
-| `tokentrim/transforms/rlm/` | TraceStore-backed memory synthesis transform using the external `rlm` runtime |
+| `tokentrim/transforms/rlm/` | TraceStore-backed next-step retrieval transform with an internal local-only mini RLM runtime |
 | `tokentrim/transforms/compress_tools/` | Deterministic tool description compression |
 | `tokentrim/transforms/create_tools/` | Model-backed missing tool creation |
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
@@ -117,21 +117,26 @@ Transform expectations:
 
 `RetrieveMemory` is a context-only transform:
 
-- it is budget-gated and only runs when the active request has a `token_budget`
-  and the current live context plus serialized trace history would exceed that
-  budget
+- it runs whenever the active request provides trace scope
 - it reads recent canonical trace history from `TraceStore`
-- it builds a prompt from the active task plus current live messages
-- it delegates synthesis to the optional external `rlm.RLM` runtime
-- it prepends one synthesized `system` memory message when successful
+- it builds a prompt from the top-level task plus the latest execution state
+- it delegates next-step retrieval to Tokentrim's internal `LocalRLMRuntime`
+- it inserts one retrieved system-memory block when successful
 - it leaves tools unchanged
 
 Operationally, `RetrieveMemory` is a no-op when trace scope is missing, no
-stored traces exist, no `token_budget` is configured, the combined live
-context plus stored trace history already fits in budget, or synthesis returns
-blank output. Invalid runtime setup raises `RLMConfigurationError`.
+stored traces exist, or the runtime returns empty output. Blank output means no
+additional memory is needed for that turn and is not treated as an error. If a
+retrieved memory block is too large, it is trimmed to `max_memory_tokens` and
+then further trimmed to any remaining request headroom; if no headroom remains,
+the block is dropped and the live transcript is preserved unchanged. Invalid
+runtime setup raises
+`RLMConfigurationError`.
 Unexpected runtime failures, including leaked RLM scaffold text such as
 `FINAL(...)` / `FINAL_VAR(...)`, raise `RLMExecutionError`.
+The current internal runtime is deliberately minimal: local in-process REPL
+execution only, `llm_query(...)`, `FINAL(...)` / `FINAL_VAR(...)`, and
+`max_depth=1` with no recursive subcalls or alternative sandbox backends.
 
 ## Pipeline Runtime
 
@@ -182,8 +187,9 @@ completed traces by `(user_id, session_id)`, returns traces newest-first, and
 orders stored spans chronologically on read.
 
 `RetrieveMemory` consumes this persisted history rather than `Result.trace`.
-It selects a bounded recent window, serializes stable canonical fields only,
-and omits raw source payloads when constructing the synthesis prompt.
+It uses the persisted history plus the current live context as a run-level
+substrate for multi-step retrieval, serializes stable canonical fields only,
+and omits raw source payloads when constructing the retrieval prompt.
 
 ## Integration Boundary
 
@@ -302,7 +308,8 @@ For local test runs, install the package in editable mode or set
 `PYTHONPATH=.` before running pytest. CI installs with:
 
 - `pip install -e ".[dev,openai-agents]"`
-- install `.[rlm]` as well when working on the recursive-memory transform
+- `.[rlm]` remains a compatibility alias, but it is not required because the
+  recursive-memory runtime now ships in-repo
 - `PYTHONPATH=.` when running `pytest -q`
 
 For empty payload runs, prefer explicit `context=[]` or `tools=[]` when calling

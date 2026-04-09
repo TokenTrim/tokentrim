@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
 
 import pytest
 
+from tokentrim.core.token_counting import count_message_tokens
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.tracing import InMemoryTraceStore, TokentrimSpanRecord, TokentrimTraceRecord
-from tokentrim.transforms.rlm import RetrieveMemory
+from tokentrim.transforms.rlm import RetrieveMemory, capture_rlm_invocation_logs
 from tokentrim.transforms.rlm.error import RLMConfigurationError, RLMExecutionError
+from tokentrim.transforms.rlm.runtime import RLMContextView
 from tokentrim.types.state import PipelineState
 
 
@@ -92,7 +94,7 @@ def _seed_trace_store(count: int) -> InMemoryTraceStore:
     return store
 
 
-def _install_fake_rlm(
+def _install_fake_runtime(
     monkeypatch: pytest.MonkeyPatch,
     *,
     response: str = "relevant memory",
@@ -100,28 +102,47 @@ def _install_fake_rlm(
 ) -> dict[str, object]:
     captured: dict[str, object] = {
         "init_kwargs": None,
-        "prompt": None,
+        "context": None,
         "root_prompt": None,
-        "closed": False,
+        "system_prompt": None,
+        "trajectory": None,
     }
 
-    class FakeRLM:
-        def __init__(self, **kwargs):
-            captured["init_kwargs"] = kwargs
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            model,
+            backend,
+            max_iterations,
+            tokenizer_model,
+            max_depth,
+            max_subcalls,
+            subcall_model,
+        ):
+            captured["init_kwargs"] = {
+                "model": model,
+                "backend": backend,
+                "max_iterations": max_iterations,
+                "tokenizer_model": tokenizer_model,
+                "max_depth": max_depth,
+                "max_subcalls": max_subcalls,
+                "subcall_model": subcall_model,
+            }
+            self.trajectory = {"depth": 0, "iterations": [{"response": response}]}
 
-        def completion(self, prompt, root_prompt=None):
-            captured["prompt"] = prompt
+        def run(self, context, root_prompt=None, system_prompt=None):
+            captured["context"] = context
             captured["root_prompt"] = root_prompt
+            captured["system_prompt"] = system_prompt
+            captured["trajectory"] = self.trajectory
             if error is not None:
                 raise error
-            return SimpleNamespace(response=response)
-
-        def close(self):
-            captured["closed"] = True
+            return response
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.transform.import_module",
-        lambda name: SimpleNamespace(RLM=FakeRLM),
+        "tokentrim.transforms.rlm.transform.LocalRLMRuntime",
+        FakeRuntime,
     )
     return captured
 
@@ -133,23 +154,6 @@ def test_rlm_is_noop_without_trace_store() -> None:
     result = step.run(
         PipelineState(context=messages, tools=[]),
         _request(trace_store=None, user_id="u1", session_id="s1"),
-    )
-
-    assert result.context == messages
-
-
-def test_rlm_is_noop_without_token_budget() -> None:
-    step = RetrieveMemory(model="memory-model")
-    messages = [{"role": "user", "content": "hello"}]
-
-    result = step.run(
-        PipelineState(context=messages, tools=[]),
-        _request(
-            trace_store=_seed_trace_store(1),
-            user_id="u1",
-            session_id="s1",
-            token_budget=None,
-        ),
     )
 
     assert result.context == messages
@@ -189,188 +193,342 @@ def test_rlm_is_noop_when_store_returns_no_traces() -> None:
     assert result.context == messages
 
 
-def test_rlm_is_noop_when_history_fits_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = _install_fake_rlm(monkeypatch)
-    step = RetrieveMemory(model="memory-model")
-    messages = [{"role": "user", "content": "hello"}]
+def test_rlm_runs_even_without_token_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _install_fake_runtime(monkeypatch)
 
-    result = step.run(
-        PipelineState(context=messages, tools=[]),
+    result = RetrieveMemory(model="memory-model").run(
+        PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
         _request(
             trace_store=_seed_trace_store(1),
             user_id="u1",
             session_id="s1",
-            token_budget=10_000,
+            token_budget=None,
         ),
     )
 
-    assert result.context == messages
-    assert captured["prompt"] is None
-
-
-def test_rlm_uses_recent_bounded_history(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = _install_fake_rlm(monkeypatch)
-    step = RetrieveMemory(model="memory-model", trace_limit=2)
-
-    step.run(
-        PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
-        _request(trace_store=_seed_trace_store(3), user_id="u1", session_id="s1"),
-    )
-
-    prompt = captured["prompt"]
-    assert isinstance(prompt, str)
-    assert "workflow-1" not in prompt
-    assert "workflow-2" in prompt
-    assert "workflow-3" in prompt
-    assert captured["init_kwargs"] == {
-        "backend": "openai",
-        "backend_kwargs": {"model_name": "memory-model"},
-        "environment": "local",
-        "max_depth": 1,
-        "max_iterations": 4,
-        "verbose": False,
+    assert isinstance(captured["context"], RLMContextView)
+    assert result.context[0] == {
+        "role": "system",
+        "content": "Retrieved memory:\nrelevant memory",
     }
 
 
-def test_rlm_serializes_selected_traces_in_chronological_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = _install_fake_rlm(monkeypatch)
-    step = RetrieveMemory(model="memory-model", trace_limit=2)
-
-    step.run(
-        PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
-        _request(trace_store=_seed_trace_store(3), user_id="u1", session_id="s1"),
+def test_rlm_uses_structured_recent_bounded_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _install_fake_runtime(monkeypatch)
+    step = RetrieveMemory(
+        model="memory-model",
+        trace_limit=2,
+        max_subcalls=6,
+        subcall_model="gpt-4o-mini",
+        max_memory_tokens=256,
     )
 
-    prompt = captured["prompt"]
-    assert isinstance(prompt, str)
-    assert prompt.index("workflow-2") < prompt.index("workflow-3")
-    assert "RAW_TRACE_workflow-2" not in prompt
-    assert "RAW_TRACE_workflow-3" not in prompt
-    assert "RAW_SPAN_summary-2" not in prompt
-    assert "RAW_SPAN_summary-3" not in prompt
-    assert '"summary":"summary-2"' in prompt
-    assert '"summary":"summary-3"' in prompt
+    step.run(
+        PipelineState(context=[{"role": "user", "content": "hello " * 4}], tools=[]),
+        _request(trace_store=_seed_trace_store(3), user_id="u1", session_id="s1", token_budget=200),
+    )
+
+    context = captured["context"]
+    assert isinstance(context, RLMContextView)
+    assert [trace.workflow_name for trace in context.traces] == ["workflow-2", "workflow-3"]
+    assert context.messages[0].content.startswith("hello")
+    assert captured["init_kwargs"] == {
+        "model": "memory-model",
+        "backend": "openai",
+        "max_iterations": 4,
+        "tokenizer_model": None,
+        "max_depth": 1,
+        "max_subcalls": 6,
+        "subcall_model": "gpt-4o-mini",
+    }
 
 
-def test_rlm_prepends_synthesized_memory_and_preserves_live_messages(
+def test_rlm_root_prompt_uses_task_brief_not_serialized_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_fake_rlm(monkeypatch, response="remember the escalation path")
+    captured = _install_fake_runtime(monkeypatch)
     step = RetrieveMemory(model="memory-model")
     messages = [
-        {"role": "system", "content": "existing system"},
-        {"role": "user", "content": "hello"},
+        {"role": "user", "content": "train the cifar classifier"},
+        {"role": "assistant", "content": "installing dependencies"},
+        {"role": "user", "content": "$ make -j2\n[exit_code] 2"},
+    ]
+
+    step.run(
+        PipelineState(context=messages, tools=[]),
+        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=20),
+    )
+
+    root_prompt = captured["root_prompt"]
+    assert isinstance(root_prompt, str)
+    assert "Top-level task:\ntrain the cifar classifier" in root_prompt
+    assert "Latest assistant action:\ninstalling dependencies" in root_prompt
+    assert 'return FINAL("") immediately' in root_prompt
+    assert "Stored trace history" not in root_prompt
+    assert "Current live context" not in root_prompt
+
+
+def test_rlm_adds_system_memory_and_preserves_live_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_runtime(monkeypatch, response="remember the escalation path")
+    step = RetrieveMemory(model="memory-model")
+    messages = [
+        {"role": "user", "content": "hello " * 40},
+        {"role": "assistant", "content": "rerunning make"},
+        {"role": "user", "content": "$ make -j2\n[exit_code] 2"},
     ]
 
     result = step.run(
         PipelineState(context=messages, tools=[]),
-        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
-    )
-
-    assert result.context == [
-        {"role": "system", "content": "remember the escalation path"},
-        {"role": "system", "content": "existing system"},
-        {"role": "user", "content": "hello"},
-    ]
-
-
-def test_rlm_uses_task_hint_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = _install_fake_rlm(monkeypatch)
-    step = RetrieveMemory(model="memory-model")
-
-    step.run(
-        PipelineState(context=[{"role": "user", "content": "ignored"}], tools=[]),
         _request(
             trace_store=_seed_trace_store(1),
             user_id="u1",
             session_id="s1",
-            task_hint="debug a failed database connection",
+            token_budget=500,
         ),
     )
 
-    assert captured["root_prompt"] == "Current task: debug a failed database connection"
-    prompt = captured["prompt"]
-    assert isinstance(prompt, str)
-    assert "Current task: debug a failed database connection" in prompt
+    assert result.context[0] == {
+        "role": "system",
+        "content": "Retrieved memory:\nremember the escalation path",
+    }
+    assert result.context[1:] == messages
 
 
-def test_rlm_falls_back_to_latest_user_message_and_live_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured = _install_fake_rlm(monkeypatch)
-    step = RetrieveMemory(model="memory-model")
+def test_rlm_inserts_memory_after_leading_system_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_runtime(monkeypatch, response="use the internal mirror URL")
     messages = [
-        {"role": "system", "content": "system note"},
-        {"role": "assistant", "content": "what do you need?"},
-        {"role": "user", "content": "please summarize our last outage"},
+        {"role": "system", "content": "summary"},
+        {"role": "assistant", "content": "checking mirrors"},
+        {"role": "user", "content": "$ curl ...\n[exit_code] 22"},
     ]
 
-    step.run(
+    result = RetrieveMemory(model="memory-model").run(
         PipelineState(context=messages, tools=[]),
-        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
+        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=500),
     )
 
-    assert captured["root_prompt"] == "Current user request: please summarize our last outage"
-    prompt = captured["prompt"]
-    assert isinstance(prompt, str)
-    assert "assistant: what do you need?" in prompt
-    assert "user: please summarize our last outage" in prompt
+    assert result.context[:2] == [
+        {"role": "system", "content": "summary"},
+        {"role": "system", "content": "Retrieved memory:\nuse the internal mirror URL"},
+    ]
+    assert result.context[2:] == messages[1:]
 
 
-def test_rlm_wraps_missing_optional_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _raise_import_error(name: str):
-        raise ImportError(name)
+def test_rlm_blank_output_is_noop_and_logged_as_no_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_runtime(monkeypatch, response="   ")
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "checking the logs"},
+    ]
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.transform.import_module", _raise_import_error)
+    with capture_rlm_invocation_logs() as logs:
+        result = RetrieveMemory(model="memory-model").run(
+            PipelineState(context=messages, tools=[]),
+            _request(
+                trace_store=_seed_trace_store(1),
+                user_id="u1",
+                session_id="s1",
+                token_budget=50,
+            ),
+        )
 
-    with pytest.raises(RLMConfigurationError) as exc_info:
+    assert result.context == messages
+    assert logs[-1]["status"] == "no_memory"
+    assert logs[-1]["synthesized_memory"] == ""
+
+
+def test_rlm_drops_memory_when_no_budget_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_runtime(monkeypatch, response="remember the failing dependency")
+    messages = [{"role": "user", "content": "hello " * 80}]
+
+    result = RetrieveMemory(model="memory-model").run(
+        PipelineState(context=messages, tools=[]),
+        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=20),
+    )
+
+    assert result.context == messages
+
+
+def test_rlm_records_invocation_log_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_runtime(monkeypatch, response='FINAL("remember the escalation path")')
+
+    with capture_rlm_invocation_logs() as logs:
         RetrieveMemory(model="memory-model").run(
+            PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+            _request(
+                trace_store=_seed_trace_store(1),
+                user_id="u1",
+                session_id="s1",
+                token_budget=200,
+            ),
+        )
+
+    assert len(logs) == 1
+    assert logs[0]["artifact_type"] == "tokentrim_rlm_invocation"
+    assert logs[0]["status"] == "ok"
+    assert logs[0]["synthesized_memory"] == "remember the escalation path"
+    assert logs[0]["response"] == 'FINAL("remember the escalation path")'
+    assert logs[0]["trajectory"] == {"depth": 0, "iterations": [{"response": 'FINAL("remember the escalation path")'}]}
+
+
+def test_rlm_rejects_recursive_max_depth() -> None:
+    with pytest.raises(RLMConfigurationError) as exc_info:
+        RetrieveMemory(model="memory-model", max_depth=2).run(
             PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
             _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
         )
 
-    assert 'tokentrim[rlm]' in str(exc_info.value)
+    assert "max_depth=1" in str(exc_info.value)
 
 
 def test_rlm_wraps_runtime_failures(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_rlm(monkeypatch, error=RuntimeError("boom"))
+    _install_fake_runtime(monkeypatch, error=RuntimeError("boom"))
 
     with pytest.raises(RLMExecutionError) as exc_info:
         RetrieveMemory(model="memory-model").run(
-            PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
-            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
+            PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=200),
         )
 
     assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
-def test_rlm_is_noop_on_blank_synthesized_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_rlm(monkeypatch, response="   ")
-    step = RetrieveMemory(model="memory-model")
-    messages = [{"role": "user", "content": "hello"}]
-
-    result = step.run(
-        PipelineState(context=messages, tools=[]),
-        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
+def test_rlm_propagates_iteration_limit_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_runtime(
+        monkeypatch,
+        error=RLMExecutionError("RLM runtime hit max iterations without producing a final answer."),
     )
 
-    assert result.context == messages
+    with pytest.raises(RLMExecutionError) as exc_info:
+        RetrieveMemory(model="memory-model").run(
+            PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=200),
+        )
+
+    assert str(exc_info.value) == "RLM runtime hit max iterations without producing a final answer."
 
 
-@pytest.mark.parametrize("response", ["FINAL_VAR(memory_block)", "FINAL(relevant memory)"])
+@pytest.mark.parametrize("response", ["FINAL_VAR(memory_block)", " FINAL_VAR(memory_block)"])
 def test_rlm_rejects_unresolved_control_output(
     monkeypatch: pytest.MonkeyPatch,
     response: str,
 ) -> None:
-    captured = _install_fake_rlm(monkeypatch, response=response)
+    _install_fake_runtime(monkeypatch, response=response)
 
     with pytest.raises(RLMExecutionError) as exc_info:
         RetrieveMemory(model="memory-model").run(
-            PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
-            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1"),
+            PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=200),
         )
 
     assert "unresolved RLM control text" in str(exc_info.value)
-    assert captured["closed"] is True
+
+
+def test_rlm_writes_debug_artifact_for_unresolved_final_var(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("TOKENTRIM_RLM_DEBUG_DIR", str(tmp_path))
+    _install_fake_runtime(monkeypatch, response="FINAL_VAR(final_answer)")
+
+    with pytest.raises(RLMExecutionError) as exc_info:
+        RetrieveMemory(model="memory-model").run(
+            PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+            _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=200),
+        )
+
+    message = str(exc_info.value)
+    assert "Debug artifact written to" in message
+
+    artifacts = list(tmp_path.glob("unresolved-final-var-*.json"))
+    assert len(artifacts) == 1
+
+    payload = json.loads(artifacts[0].read_text())
+    assert payload["artifact_type"] == "tokentrim_rlm_unresolved_final_var"
+    assert payload["response"] == "FINAL_VAR(final_answer)"
+    assert payload["final_var_name"] == "final_answer"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ("FINAL(\"relevant memory\")", "relevant memory"),
+        ("FINAL(\n\"relevant memory\nsecond line\"\n)", "relevant memory\nsecond line"),
+    ],
+)
+def test_rlm_unwraps_final_string_output(
+    monkeypatch: pytest.MonkeyPatch,
+    response: str,
+    expected: str,
+) -> None:
+    _install_fake_runtime(monkeypatch, response=response)
+
+    result = RetrieveMemory(model="memory-model").run(
+        PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+        _request(
+            trace_store=_seed_trace_store(1),
+            user_id="u1",
+            session_id="s1",
+            token_budget=200,
+        ),
+    )
+
+    assert result.context[0] == {
+        "role": "system",
+        "content": f"Retrieved memory:\n{expected}",
+    }
+
+
+@pytest.mark.parametrize(
+    ("backend", "model", "expected_model"),
+    [
+        ("openai", "gpt-4.1-mini", "openai/gpt-4.1-mini"),
+        ("anthropic", "claude-3-5-sonnet", "anthropic/claude-3-5-sonnet"),
+        ("openai", "openai/gpt-4.1-mini", "openai/gpt-4.1-mini"),
+    ],
+)
+def test_rlm_uses_runtime_model_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    model: str,
+    expected_model: str,
+) -> None:
+    observed_models: list[str] = []
+
+    def fake_generate_text(**kwargs):
+        observed_models.append(kwargs["model"])
+        return 'FINAL("relevant memory")'
+
+    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+
+    result = RetrieveMemory(model=model, backend=backend).run(
+        PipelineState(context=[{"role": "user", "content": "hello " * 10}], tools=[]),
+        _request(
+            trace_store=_seed_trace_store(1),
+            user_id="u1",
+            session_id="s1",
+            token_budget=200,
+        ),
+    )
+
+    assert result.context[0] == {
+        "role": "system",
+        "content": "Retrieved memory:\nrelevant memory",
+    }
+    assert observed_models == [expected_model]
+
+
+def test_rlm_trims_memory_to_max_memory_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_runtime(monkeypatch, response="chunk " * 200)
+
+    result = RetrieveMemory(model="memory-model", max_memory_tokens=20).run(
+        PipelineState(context=[{"role": "user", "content": "hello"}], tools=[]),
+        _request(trace_store=_seed_trace_store(1), user_id="u1", session_id="s1", token_budget=None),
+    )
+
+    assert result.context[0]["role"] == "system"
+    assert count_message_tokens([result.context[0]], None) <= 20

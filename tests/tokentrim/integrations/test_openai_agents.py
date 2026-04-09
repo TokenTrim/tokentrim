@@ -1,26 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
-from types import SimpleNamespace
 
 import pytest
 
-agents = pytest.importorskip("agents")
+if importlib.util.find_spec("agents") is None:
+    pytestmark = pytest.mark.skip(reason="agents not installed")
+else:
+    from agents import Agent, RunConfig
+    from agents.handoffs import HandoffInputData
+    from agents.run import CallModelData, ModelInputData
 
-from agents import Agent, RunConfig
-from agents.handoffs import HandoffInputData
-from agents.run import CallModelData, ModelInputData
-
-from tokentrim import Tokentrim
-from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
-from tokentrim.integrations.base import IntegrationAdapter
-from tokentrim.integrations.openai_agents import (
-    OpenAIAgentsAdapter,
-    OpenAIAgentsOptions,
-)
-from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
-from tokentrim.tracing import InMemoryTraceStore, TokentrimTraceRecord
+    from tokentrim import Tokentrim
+    from tokentrim.integrations.base import IntegrationAdapter
+    from tokentrim.integrations.openai_agents import (
+        OpenAIAgentsAdapter,
+        OpenAIAgentsOptions,
+    )
+    from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
+    from tokentrim.tracing import InMemoryTraceStore, TokentrimTraceRecord
+    from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
 
 
 def _seed_trace_store() -> InMemoryTraceStore:
@@ -48,21 +49,36 @@ def _seed_trace_store() -> InMemoryTraceStore:
 
 
 def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
-    class FakeRLM:
-        def __init__(self, **kwargs):
-            del kwargs
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            model,
+            backend,
+            max_iterations,
+            tokenizer_model,
+            max_depth,
+            max_subcalls,
+            subcall_model,
+        ):
+            del model
+            del backend
+            del max_iterations
+            del tokenizer_model
+            del max_depth
+            del max_subcalls
+            del subcall_model
+            self.trajectory = {"iterations": [{"response": response}]}
 
-        def completion(self, prompt, root_prompt=None):
+        def run(self, prompt, root_prompt=None, system_prompt=None):
             del prompt
             del root_prompt
-            return SimpleNamespace(response=response)
-
-        def close(self):
-            return None
+            del system_prompt
+            return response
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.transform.import_module",
-        lambda name: SimpleNamespace(RLM=FakeRLM),
+        "tokentrim.transforms.rlm.transform.LocalRLMRuntime",
+        FakeRuntime,
     )
 
 
@@ -217,10 +233,10 @@ def test_openai_agents_adapter_applies_rlm_to_handoff_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = Tokentrim()
-    _install_fake_rlm(monkeypatch, response="stored context")
+    _install_fake_rlm(monkeypatch, response="ctx")
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
-            token_budget=10,
+            token_budget=200,
             user_id="u1",
             session_id="s1",
             trace_store=_seed_trace_store(),
@@ -228,7 +244,7 @@ def test_openai_agents_adapter_applies_rlm_to_handoff_history(
         )
     ).wrap(client)
     payload = HandoffInputData(
-        input_history="hello",
+        input_history="hello " * 40,
         pre_handoff_items=(),
         new_items=(),
     )
@@ -236,8 +252,8 @@ def test_openai_agents_adapter_applies_rlm_to_handoff_history(
     result = asyncio.run(wrapped.handoff_input_filter(payload))
 
     assert result.input_history == (
-        {"role": "system", "content": "stored context"},
-        {"role": "user", "content": "hello"},
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+        {"role": "user", "content": "hello " * 40},
     )
     assert result.pre_handoff_items == ()
     assert result.new_items == ()
