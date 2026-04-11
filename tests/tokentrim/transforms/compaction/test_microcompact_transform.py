@@ -8,6 +8,7 @@ from tokentrim.transforms.compaction.config import (
     get_context_edit_config,
     get_microcompact_config,
 )
+from tokentrim.transforms import MicrocompactMessages as PublicMicrocompactMessages
 from tokentrim.transforms.compaction.microcompact import (
     MicrocompactConfig,
     MicrocompactMessages,
@@ -35,6 +36,7 @@ def test_microcompact_exposes_standalone_transform() -> None:
     )
 
     assert result.context == [{"role": "user", "content": "short"}]
+    assert isinstance(PublicMicrocompactMessages(), MicrocompactMessages)
 
 
 def test_microcompact_uses_age_based_policy_to_keep_recent_groups_verbose() -> None:
@@ -167,6 +169,81 @@ def test_microcompact_becomes_more_aggressive_under_budget_pressure() -> None:
     assert normal == messages
     assert pressured[0]["role"] == "system"
     assert "kind=tool_round" in pressured[0]["content"]
+
+
+def test_microcompact_compacts_oversized_recent_tool_result_under_pressure() -> None:
+    orchestrator = MicrocompactOrchestrator(
+        config=MicrocompactConfig(
+            min_content_chars=10_000,
+            aggressive_min_content_chars=10_000,
+            recent_groups_to_keep=3,
+            recent_tool_groups_to_keep=1,
+            oversized_tool_result_chars=400,
+            oversized_tool_result_tokens=50,
+            use_salience_scoring=False,
+        )
+    )
+    messages = [
+        {"role": "user", "content": "keep this recent request"},
+        {"role": "assistant", "content": "keep this recent response"},
+        {
+            "role": "assistant",
+            "content": "Running the command now.",
+            "tool_calls": [{"id": "call_recent_1", "function": {"name": "bash"}}],
+        },
+        {
+            "role": "tool",
+            "name": "bash",
+            "tool_call_id": "call_recent_1",
+            "content": "$ pytest tests/test_cli.py\n" + ("very noisy output\n" * 80) + "[exit_code] 1",
+        },
+    ]
+
+    normal = orchestrator.apply(messages, token_budget=50_000)
+    pressured = orchestrator.apply(messages, token_budget=40)
+
+    assert normal == messages
+    assert pressured[0:2] == messages[0:2]
+    assert len(pressured) == 3
+    assert pressured[2]["role"] == "system"
+    assert "kind=tool_round" in pressured[2]["content"]
+    assert "bash(id=call_recent_1)" in pressured[2]["content"]
+    assert "bash→result(id=call_recent_1)" in pressured[2]["content"]
+
+
+def test_microcompact_keeps_tool_call_result_pair_invariant_when_compacting_recent_round() -> None:
+    orchestrator = MicrocompactOrchestrator(
+        config=MicrocompactConfig(
+            min_content_chars=10_000,
+            aggressive_min_content_chars=10_000,
+            recent_groups_to_keep=2,
+            recent_tool_groups_to_keep=1,
+            oversized_tool_result_chars=200,
+            oversized_tool_result_tokens=30,
+            use_salience_scoring=False,
+        )
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Inspect the build output.",
+            "tool_calls": [{"id": "call_pair_1", "function": {"name": "bash"}}],
+        },
+        {
+            "role": "tool",
+            "name": "bash",
+            "tool_call_id": "call_pair_1",
+            "content": "stderr: missing header\n" + ("trace\n" * 60),
+        },
+        {"role": "assistant", "content": "I need to install the missing dependency."},
+    ]
+
+    pressured = orchestrator.apply(messages, token_budget=30)
+
+    assert pressured[0]["role"] == "system"
+    assert "kind=tool_round" in pressured[0]["content"]
+    assert pressured[1] == messages[2]
+    assert not any(message.get("role") == "tool" for message in pressured)
 
 
 def test_microcompact_salience_scoring_preserves_high_value_content() -> None:

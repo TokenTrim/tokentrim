@@ -34,6 +34,8 @@ DEFAULT_MIN_MESSAGES: Final[int] = 2
 DEFAULT_MIN_TOKENS_SAVED: Final[int] = 1
 DEFAULT_AGGRESSIVE_MIN_CONTENT_CHARS: Final[int] = 120
 DEFAULT_AGGRESSIVE_RECENT_GROUPS_TO_KEEP: Final[int] = 1
+DEFAULT_OVERSIZED_TOOL_RESULT_CHARS: Final[int] = 4_000
+DEFAULT_OVERSIZED_TOOL_RESULT_TOKENS: Final[int] = 1_000
 
 # =============================================================================
 # CompactConversation Defaults
@@ -87,6 +89,8 @@ class MicrocompactConfig:
     min_tokens_saved: int = DEFAULT_MIN_TOKENS_SAVED
     aggressive_min_content_chars: int = DEFAULT_AGGRESSIVE_MIN_CONTENT_CHARS
     aggressive_recent_groups_to_keep: int = DEFAULT_AGGRESSIVE_RECENT_GROUPS_TO_KEEP
+    oversized_tool_result_chars: int = DEFAULT_OVERSIZED_TOOL_RESULT_CHARS
+    oversized_tool_result_tokens: int = DEFAULT_OVERSIZED_TOOL_RESULT_TOKENS
     # Salience scoring settings
     use_salience_scoring: bool = True
     min_salience_to_protect: int = 30  # Don't compact groups above this salience score

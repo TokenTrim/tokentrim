@@ -87,7 +87,7 @@ through one shared `PipelineState`.
 
 Tokentrim uses minimal payload types:
 
-- `Message`: `{role, content}`
+- `Message`: `{role, content}` with optional structured tool fields
 - `Tool`: `{name, description, input_schema}`
 - `PipelineState`: `{context: list[Message], tools: list[Tool]}`
 
@@ -98,6 +98,33 @@ Every run returns one `Result`:
 - `tools: tuple[Tool, ...]`
 
 Both result payloads are always present. Unused sides are empty tuples.
+
+### Canonical Message Shape
+
+Tokentrim treats conversation messages as one shared structure across all
+integrations. The minimum shape is still `{role, content}`, but integrations
+should preserve tool structure instead of flattening it into fake user turns.
+
+Canonical cases:
+
+1. user message
+   - `{"role": "user", "content": "..."}`
+2. assistant message
+   - `{"role": "assistant", "content": "..."}`
+3. assistant tool call
+   - `{"role": "assistant", "content": "...", "tool_calls": [...]}`
+4. tool result
+   - `{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}`
+
+This matters for context management:
+
+- compaction can distinguish conversational turns from tool traffic
+- tool-output-specific microcompaction can operate structurally instead of
+  heuristically
+- trace-driven transforms such as retrieval can preserve more useful signal
+
+Integrations should not encode tool output as `role="user"` unless the host SDK
+gives no way to preserve tool-call structure.
 
 ## Transform Contract
 

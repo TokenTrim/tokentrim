@@ -6,10 +6,13 @@ pre-processing (microcompact, context edit) and LLM-backed summarization.
 
 Public API:
     CompactConversation: Main transform for compacting conversation history.
+    MicrocompactMessages: Deterministic tool/result-oriented pre-compaction step.
 """
 
+from tokentrim.transforms.compaction.microcompact import MicrocompactMessages
 from tokentrim.transforms.compaction.transform import CompactConversation
 
 __all__ = [
     "CompactConversation",
+    "MicrocompactMessages",
 ]

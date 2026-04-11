@@ -274,7 +274,10 @@ class MicrocompactOrchestrator:
         total_chars = sum(len(get_text_content(message)) for message in group.messages)
 
         if group.kind == "tool_round":
+            oversized_tool_result = self._has_oversized_tool_result(group)
             if group.age_band == "recent":
+                if pressure == "high" and oversized_tool_result:
+                    return True
                 return pressure == "high" and total_chars >= min_content_chars
             return total_chars >= max(80, min_content_chars // 2)
 
@@ -282,6 +285,18 @@ class MicrocompactOrchestrator:
             return total_chars >= min_content_chars or len(group.messages) > 1
         if group.age_band == "old":
             return total_chars >= min_content_chars
+        return False
+
+    def _has_oversized_tool_result(self, group: MessageGroup) -> bool:
+        for message in group.messages:
+            if not is_tool_result(message):
+                continue
+            content = get_text_content(message)
+            if len(content) >= self.config.oversized_tool_result_chars:
+                return True
+            message_tokens = count_message_tokens([message], self.tokenizer_model)
+            if message_tokens >= self.config.oversized_tool_result_tokens:
+                return True
         return False
 
     def _compute_group_salience(self, group: MessageGroup) -> int:

@@ -60,13 +60,14 @@ If you are trying Tokentrim for the first time:
 
 ```python
 from tokentrim import InMemoryTraceStore, Tokentrim
-from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
+from tokentrim.transforms import CompactConversation, FilterMessages, MicrocompactMessages, RetrieveMemory
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
 trace_store = InMemoryTraceStore()
 
 result = tt.compose(
+    MicrocompactMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
     RetrieveMemory(model="gpt-4o-mini"),
 ).apply(
@@ -80,6 +81,7 @@ optimized_messages = result.context
 
 What happens here:
 
+- Tokentrim first microcompacts older tool/result-heavy traffic deterministically.
 - Tokentrim checks whether the current context is over budget.
 - If it is, it extracts working state, edits stale context, and compacts older
   history.
@@ -114,6 +116,7 @@ from tokentrim.transforms import (
     CompressToolDescriptions,
     CreateTools,
     FilterMessages,
+    MicrocompactMessages,
     RetrieveMemory,
 )
 
@@ -123,6 +126,7 @@ trace_store = InMemoryTraceStore()
 
 result = tt.compose(
     FilterMessages(),
+    MicrocompactMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
     RetrieveMemory(model="gpt-4o-mini"),
     CompressToolDescriptions(max_description_chars=160),
@@ -146,6 +150,18 @@ both payload kinds.
 `context=[...]` and `tools=[...]` are the preferred explicit call shapes.
 `apply(payload)` still works for non-empty lists, but the named arguments are
 clearer and safer.
+
+Tokentrim also understands structured tool traffic inside `context`. The
+preferred message model is:
+
+- user turn: `{"role": "user", "content": "..."}`
+- assistant turn: `{"role": "assistant", "content": "..."}`
+- assistant tool call: `{"role": "assistant", "content": "...", "tool_calls": [...]}`
+- tool result: `{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}`
+
+If an integration has real tool calls, preserve them in this shape instead of
+flattening tool output into fake user messages. That keeps compaction and future
+tool-output microcompaction structurally correct.
 
 `tokenizer` is the shared model used for token counting only. Model-backed
 transforms define their own model (for example
