@@ -151,11 +151,10 @@ def test_compaction_respects_custom_keep_last(monkeypatch: pytest.MonkeyPatch) -
     assert result.context[1:] == messages[-8:]
 
 
-def test_compaction_respects_reserved_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_compaction_automatic_budget_reserves_output_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
     step = CompactConversation(
-        model="compact-model",
-        reserve_tokens=30,
-        tokenizer_model=None,
+        model="gpt-4o-mini",
+        context_window=100,
     )
     messages = _messages(8)
 
@@ -163,9 +162,15 @@ def test_compaction_respects_reserved_headroom(monkeypatch: pytest.MonkeyPatch) 
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
-    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=80))
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: 90 if len(counted_messages) == len(messages) else 10,
+    )
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=None))
 
-    assert result.context[0] == {"role": "system", "content": "summary"}
+    assert result.context[0]["role"] == "system"
+    assert "History only." in result.context[0]["content"]
+    assert "summary" in result.context[0]["content"]
     assert result.context[1:] == messages[-6:]
 
 
@@ -190,13 +195,10 @@ def test_compaction_raises_for_invalid_configuration_before_running() -> None:
         CompactConversation(model="compact-model", strategy="invalid").run(state, request)  # type: ignore[arg-type]
 
 
-def test_compaction_raises_when_reserved_tokens_are_negative() -> None:
-    step = CompactConversation(model="compact-model", reserve_tokens=-1, tokenizer_model=None)
+def test_compaction_resolve_token_budget_uses_output_and_buffer_headroom() -> None:
+    step = CompactConversation(model="gpt-4o-mini", context_window=100)
 
-    with pytest.raises(TokentrimError) as exc_info:
-        step.run(PipelineState(context=_messages(8), tools=[]), _request(token_budget=5))
-
-    assert "reserve_tokens" in str(exc_info.value)
+    assert step.resolve_token_budget(None) == 57
 
 
 def test_compaction_only_sends_older_messages_to_summarizer(

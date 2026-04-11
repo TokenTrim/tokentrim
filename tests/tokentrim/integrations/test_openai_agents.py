@@ -21,7 +21,20 @@ else:
     )
     from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
     from tokentrim.tracing import InMemoryTraceStore, TokentrimTraceRecord
-    from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
+    from tokentrim.transforms import CompactConversation, RetrieveMemory
+    from tokentrim.transforms.base import Transform
+    from tokentrim.pipeline.requests import PipelineRequest
+    from tokentrim.types.state import PipelineState
+
+    class TestFilterTransform(Transform):
+        @property
+        def name(self) -> str:
+            return "test-filter"
+
+        def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+            del request
+            filtered = [message for message in state.context if message["content"].strip()]
+            return PipelineState(context=filtered, tools=state.tools)
 
 
 def _seed_trace_store() -> InMemoryTraceStore:

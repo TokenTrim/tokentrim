@@ -21,7 +21,7 @@ from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.tool import Tool
 from tokentrim.types.trace import Trace
-from tokentrim.transforms import CompactConversation
+from tokentrim.transforms import CompactConversation, RetrieveMemory
 from tokentrim.transforms.base import Transform
 
 
@@ -425,19 +425,13 @@ def test_compose_apply_context_wires_compaction(
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
-    assert result.context[:2] == (
-        {"role": "system", "content": "summary"},
-        {"role": "system", "content": "Retrieved memory:\nctx"},
-    )
+    assert result.context[0] == {"role": "system", "content": "History only.\n\nsummary"}
+    assert result.context[1] == {"role": "system", "content": "Retrieved memory:\nctx"}
     assert result.context[-2:] == (
-        {"role": "user", "content": "5"},
+        {"role": "user", "content": "issue-five"},
         {"role": "assistant", "content": "6"},
     )
-    assert [trace.step_name for trace in result.trace.steps] == [
-        "filter",
-        "compaction",
-        "rlm",
-    ]
+    assert [trace.step_name for trace in result.trace.steps] == ["compaction", "rlm"]
     assert all(message["content"].strip() for message in result.context)
     assert result.trace.output_tokens > 0
 

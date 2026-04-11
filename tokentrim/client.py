@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from agents import RunConfig
 
     from tokentrim.integrations.base import IntegrationAdapter
-    from tokentrim.integrations.openai_agents import OpenAIAgentsAdapter, OpenAIAgentsOptions
     from tokentrim.tracing import PipelineTracer, TraceStore
 
 

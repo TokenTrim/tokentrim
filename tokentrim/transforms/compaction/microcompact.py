@@ -43,7 +43,6 @@ from tokentrim.types.message import (
     Message,
     extract_image_refs,
     get_text_content,
-    has_images,
     has_tool_calls,
     is_tool_result,
 )
