@@ -11,13 +11,73 @@ from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
 from tokentrim.pipeline.requests import PipelineRequest
-from tokentrim.tracing import InMemoryTraceStore, PipelineSpan, PipelineTracer
+from tokentrim.tracing import (
+    InMemoryTraceStore,
+    PipelineSpan,
+    PipelineTracer,
+    TokentrimTraceRecord,
+)
 from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.tool import Tool
 from tokentrim.types.trace import Trace
 from tokentrim.transforms import CompactConversation
 from tokentrim.transforms.base import Transform
+
+
+def _seed_trace_store() -> InMemoryTraceStore:
+    store = InMemoryTraceStore()
+    store.create_trace(
+        user_id="u1",
+        session_id="s1",
+        trace=TokentrimTraceRecord(
+            trace_id="openai_agents:trace_1",
+            source="openai_agents",
+            capture_mode="identity",
+            source_trace_id="trace_1",
+            user_id="u1",
+            session_id="s1",
+            workflow_name="workflow-1",
+            started_at=None,
+            ended_at=None,
+            group_id=None,
+            metadata={"topic": "support"},
+            raw_trace={"ignored": "raw"},
+        ),
+    )
+    store.complete_trace(trace_id="openai_agents:trace_1")
+    return store
+
+
+def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            model,
+            backend,
+            max_iterations,
+            tokenizer_model,
+            max_depth,
+            max_subcalls,
+            subcall_model,
+        ):
+            del model
+            del backend
+            del max_iterations
+            del tokenizer_model
+            del max_depth
+            del max_subcalls
+            del subcall_model
+            self.trajectory = {"iterations": [{"response": response}]}
+
+        def run(self, prompt, root_prompt=None, system_prompt=None):
+            del prompt
+            del root_prompt
+            del system_prompt
+            return response
+
+    monkeypatch.setattr("tokentrim.transforms.rlm.transform.LocalRLMRuntime", FakeRuntime)
 
 
 class EchoAdapter(IntegrationAdapter[str]):
@@ -185,6 +245,26 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
     assert captured["pipeline_tracer"] is pipeline_tracer
 
 
+def test_rlm_store_belongs_to_rlm_transform(monkeypatch: pytest.MonkeyPatch) -> None:
+    trace_store = _seed_trace_store()
+    client = Tokentrim()
+    messages = [{"role": "user", "content": "hello " * 40}]
+    _install_fake_rlm(monkeypatch, response="ctx")
+
+    result = client.compose(RetrieveMemory(model="memory-model")).apply(
+        messages,
+        user_id="u1",
+        session_id="s1",
+        token_budget=200,
+        trace_store=trace_store,
+    )
+
+    assert result.context == (
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+        {"role": "user", "content": "hello " * 40},
+    )
+
+
 def test_constructor_does_not_define_per_transform_models() -> None:
     client = Tokentrim(tokenizer="shared-model")
 
@@ -323,6 +403,7 @@ def test_compose_apply_context_wires_compaction(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
+    _install_fake_rlm(monkeypatch, response="ctx")
     original_message_count = len(messages)
     monkeypatch.setattr(
         "tokentrim.transforms.compaction.transform.count_message_tokens",
@@ -332,17 +413,31 @@ def test_compose_apply_context_wires_compaction(
     )
     result = client.compose(
         CompactConversation(model="compact-model"),
+        RetrieveMemory(model="memory-model"),
     ).apply(
         messages,
-        token_budget=200,
+        user_id="u1",
+        session_id="s1",
+        token_budget=40,
+        trace_store=_seed_trace_store(),
     )
 
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
-    assert result.context[0]["role"] == "system"
-    assert "summary" in result.context[0]["content"]
-    assert [trace.step_name for trace in result.trace.steps] == ["compaction"]
+    assert result.context[:2] == (
+        {"role": "system", "content": "summary"},
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+    )
+    assert result.context[-2:] == (
+        {"role": "user", "content": "5"},
+        {"role": "assistant", "content": "6"},
+    )
+    assert [trace.step_name for trace in result.trace.steps] == [
+        "filter",
+        "compaction",
+        "rlm",
+    ]
     assert all(message["content"].strip() for message in result.context)
     assert result.trace.output_tokens > 0
 

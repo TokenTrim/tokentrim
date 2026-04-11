@@ -15,12 +15,14 @@ def generate_text(
     completion_options: Mapping[str, Any] | None = None,
 ) -> str:
     try:
-        from litellm import completion
+        import litellm
     except ImportError as exc:
         raise TokentrimError(
             "litellm is required for model-backed Tokentrim features."
         ) from exc
 
+    completion = litellm.completion
+    debug_state = _capture_litellm_debug_state(litellm)
     try:
         completion_kwargs: dict[str, Any] = {
             "model": model,
@@ -33,11 +35,14 @@ def generate_text(
         if completion_options is not None:
             completion_kwargs.update(dict(completion_options))
 
+        _apply_litellm_debug_suppression(litellm)
         response = completion(**completion_kwargs)
     except Exception as exc:
         raise TokentrimError(
             f"LiteLLM completion failed for model '{model}'."
         ) from exc
+    finally:
+        _restore_litellm_debug_state(litellm, debug_state)
 
     try:
         return _extract_content(response).strip()
@@ -46,11 +51,42 @@ def generate_text(
 
 
 def _should_omit_temperature(*, model: str, temperature: float) -> bool:
-    normalized_model = model.strip().lower()
     if temperature != 0.0:
         return False
 
-    return normalized_model == "gpt-5" or normalized_model.startswith("gpt-5-")
+    bare_model = _normalize_temperature_model_name(model)
+    return bare_model == "gpt-5" or bare_model.startswith(("gpt-5-", "gpt-5."))
+
+
+def _normalize_temperature_model_name(model: str) -> str:
+    normalized_model = model.strip().lower()
+    if "/" in normalized_model:
+        _, _, normalized_model = normalized_model.partition("/")
+    return normalized_model
+
+
+def _capture_litellm_debug_state(litellm: Any) -> dict[str, tuple[bool, Any]]:
+    return {
+        "suppress_debug_info": (hasattr(litellm, "suppress_debug_info"), getattr(litellm, "suppress_debug_info", None)),
+        "set_verbose": (hasattr(litellm, "set_verbose"), getattr(litellm, "set_verbose", None)),
+    }
+
+
+def _apply_litellm_debug_suppression(litellm: Any) -> None:
+    litellm.suppress_debug_info = True
+    if hasattr(litellm, "set_verbose"):
+        litellm.set_verbose = False
+
+
+def _restore_litellm_debug_state(
+    litellm: Any,
+    debug_state: dict[str, tuple[bool, Any]],
+) -> None:
+    for name, (had_attr, value) in debug_state.items():
+        if had_attr:
+            setattr(litellm, name, value)
+        elif hasattr(litellm, name):
+            delattr(litellm, name)
 
 
 def _extract_content(response: Any) -> str:

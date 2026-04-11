@@ -151,6 +151,24 @@ def test_compaction_respects_custom_keep_last(monkeypatch: pytest.MonkeyPatch) -
     assert result.context[1:] == messages[-8:]
 
 
+def test_compaction_respects_reserved_headroom(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactConversation(
+        model="compact-model",
+        reserve_tokens=30,
+        tokenizer_model=None,
+    )
+    messages = _messages(8)
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=80))
+
+    assert result.context[0] == {"role": "system", "content": "summary"}
+    assert result.context[1:] == messages[-6:]
+
+
 def test_compaction_raises_when_model_is_missing_and_over_budget() -> None:
     step = CompactConversation(model=None)
     messages = _messages(8)
@@ -170,6 +188,15 @@ def test_compaction_raises_for_invalid_configuration_before_running() -> None:
 
     with pytest.raises(CompactionConfigurationError):
         CompactConversation(model="compact-model", strategy="invalid").run(state, request)  # type: ignore[arg-type]
+
+
+def test_compaction_raises_when_reserved_tokens_are_negative() -> None:
+    step = CompactConversation(model="compact-model", reserve_tokens=-1, tokenizer_model=None)
+
+    with pytest.raises(TokentrimError) as exc_info:
+        step.run(PipelineState(context=_messages(8), tools=[]), _request(token_budget=5))
+
+    assert "reserve_tokens" in str(exc_info.value)
 
 
 def test_compaction_only_sends_older_messages_to_summarizer(

@@ -1,50 +1,85 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 
 import pytest
 
-agents = pytest.importorskip("agents")
+if importlib.util.find_spec("agents") is None:
+    pytestmark = pytest.mark.skip(reason="agents not installed")
+else:
+    from agents import Agent, RunConfig
+    from agents.handoffs import HandoffInputData
+    from agents.run import CallModelData, ModelInputData
 
-from agents import Agent, RunConfig
-from agents.handoffs import HandoffInputData
-from agents.run import CallModelData, ModelInputData
-
-from tokentrim import Tokentrim
-from tokentrim.transforms import CompactConversation
-from tokentrim.integrations.base import IntegrationAdapter
-from tokentrim.integrations.openai_agents import (
-    OpenAIAgentsAdapter,
-    OpenAIAgentsOptions,
-)
-from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
-from tokentrim.tracing import InMemoryTraceStore
-from tokentrim.transforms.base import Transform
-from tokentrim.pipeline.requests import PipelineRequest
-from tokentrim.types.state import PipelineState
+    from tokentrim import Tokentrim
+    from tokentrim.integrations.base import IntegrationAdapter
+    from tokentrim.integrations.openai_agents import (
+        OpenAIAgentsAdapter,
+        OpenAIAgentsOptions,
+    )
+    from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
+    from tokentrim.tracing import InMemoryTraceStore, TokentrimTraceRecord
+    from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
 
 
-class TestFilterTransform(Transform):
-    @property
-    def name(self) -> str:
-        return "test-filter"
+def _seed_trace_store() -> InMemoryTraceStore:
+    store = InMemoryTraceStore()
+    store.create_trace(
+        user_id="u1",
+        session_id="s1",
+        trace=TokentrimTraceRecord(
+            trace_id="openai_agents:trace_1",
+            source="openai_agents",
+            capture_mode="identity",
+            source_trace_id="trace_1",
+            user_id="u1",
+            session_id="s1",
+            workflow_name="workflow-1",
+            started_at=None,
+            ended_at=None,
+            group_id=None,
+            metadata={"topic": "support"},
+            raw_trace={"ignored": "raw"},
+        ),
+    )
+    store.complete_trace(trace_id="openai_agents:trace_1")
+    return store
 
-    def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
-        del request
-        filtered = [message for message in state.context if message["content"].strip()]
-        if not filtered:
-            return PipelineState(context=[], tools=state.tools)
-        result = []
-        for message in filtered:
-            if result and result[-1]["role"] == message["role"] and result[-1]["content"] == message["content"]:
-                result[-1] = {
-                    "role": message["role"],
-                    "content": f"{message['content']} [repeated 2x]",
-                }
-                continue
-            result.append(message)
-        return PipelineState(context=result, tools=state.tools)
+
+def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
+    class FakeRuntime:
+        def __init__(
+            self,
+            *,
+            model,
+            backend,
+            max_iterations,
+            tokenizer_model,
+            max_depth,
+            max_subcalls,
+            subcall_model,
+        ):
+            del model
+            del backend
+            del max_iterations
+            del tokenizer_model
+            del max_depth
+            del max_subcalls
+            del subcall_model
+            self.trajectory = {"iterations": [{"response": response}]}
+
+        def run(self, prompt, root_prompt=None, system_prompt=None):
+            del prompt
+            del root_prompt
+            del system_prompt
+            return response
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.rlm.transform.LocalRLMRuntime",
+        FakeRuntime,
+    )
 
 
 def _message_items(count: int) -> list[dict[str, str]]:
@@ -192,6 +227,36 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
         {"role": "user", "content": "ping"},
         {"role": "assistant", "content": "pong"},
     ]
+
+
+def test_openai_agents_adapter_applies_rlm_to_handoff_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Tokentrim()
+    _install_fake_rlm(monkeypatch, response="ctx")
+    wrapped = OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(
+            token_budget=200,
+            user_id="u1",
+            session_id="s1",
+            trace_store=_seed_trace_store(),
+            steps=(RetrieveMemory(model="memory-model"),),
+        )
+    ).wrap(client)
+    payload = HandoffInputData(
+        input_history="hello " * 40,
+        pre_handoff_items=(),
+        new_items=(),
+    )
+
+    result = asyncio.run(wrapped.handoff_input_filter(payload))
+
+    assert result.input_history == (
+        {"role": "system", "content": "Retrieved memory:\nctx"},
+        {"role": "user", "content": "hello " * 40},
+    )
+    assert result.pre_handoff_items == ()
+    assert result.new_items == ()
 
 
 def test_openai_agents_adapter_preserves_rich_response_items() -> None:
