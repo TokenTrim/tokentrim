@@ -338,7 +338,49 @@ def test_compaction_infers_auto_budget_from_model_name() -> None:
         model="openai/mercury-2",
     )
 
-    assert step._resolve_effective_token_budget(None) == 188_000
+    assert step._resolve_effective_token_budget(None) == 116_000
+
+
+def test_compaction_chunks_oversized_summary_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    step = CompactConversation(model="openai/mercury-2")
+    messages = [{"role": "user", "content": "x" * 400} for _ in range(10)]
+    original_message_count = len(messages)
+    generated_chunks: list[int] = []
+
+    def fake_generate(self, *, messages, template, preserved_artifacts):
+        del self, template, preserved_artifacts
+        generated_chunks.append(len(messages))
+        return _valid_summary()
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.CompactionLLM.generate",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        CompactConversation,
+        "_resolve_compactor_prompt_budget",
+        lambda self: 500,
+    )
+    monkeypatch.setattr(
+        CompactConversation,
+        "_estimate_compactor_prompt_tokens",
+        lambda self, messages, template: sum(
+            len(str(message["content"])) for message in messages
+        ),
+    )
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.count_message_tokens",
+        lambda counted_messages, tokenizer_model=None: (
+            1_000 if len(counted_messages) == original_message_count else 10
+        ),
+    )
+
+    result = step.run(PipelineState(context=messages, tools=[]), _request(token_budget=130))
+
+    assert generated_chunks
+    assert 4 not in generated_chunks
+    assert result.context[0]["role"] == "system"
+    assert "Goal:\nfix issue" in result.context[0]["content"]
 
 
 def test_compaction_returns_none_when_auto_budget_cannot_be_inferred() -> None:

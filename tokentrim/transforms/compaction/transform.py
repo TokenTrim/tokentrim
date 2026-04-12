@@ -62,12 +62,31 @@ class CompactionLLM:
         template: PromptTemplate,
         preserved_artifacts: Sequence[str],
     ) -> str:
+        prompt = self.build_prompt(
+            messages=messages,
+            template=template,
+            preserved_artifacts=preserved_artifacts,
+        )
+        return generate_text(
+            model=self.model,
+            messages=prompt,
+            temperature=0.0,
+            completion_options=self.model_options,
+        )
+
+    def build_prompt(
+        self,
+        *,
+        messages: Sequence[Message],
+        template: PromptTemplate,
+        preserved_artifacts: Sequence[str],
+    ) -> list[Message]:
         formatted_history = "\n\n".join(
             f"[{i}] role={msg['role']}\n{get_text_content(msg)}"
             for i, msg in enumerate(messages, start=1)
         )
         artifacts_text = "\n".join(f"- {artifact}" for artifact in preserved_artifacts) or "- none"
-        prompt: list[Message] = [
+        return [
             {"role": "system", "content": template.system_prompt},
             {
                 "role": "user",
@@ -77,12 +96,6 @@ class CompactionLLM:
                 ),
             },
         ]
-        return generate_text(
-            model=self.model,
-            messages=prompt,
-            temperature=0.0,
-            completion_options=self.model_options,
-        )
 
 @dataclass(frozen=True, slots=True)
 class CompactConversation(Transform):
@@ -233,12 +246,18 @@ class CompactConversation(Transform):
     def _infer_context_window_from_model(self) -> int | None:
         candidates = [self.model, self._tokenizer_model]
         for candidate in candidates:
-            if not candidate:
-                continue
-            normalized = candidate.lower()
-            for pattern, context_window in MODEL_CONTEXT_WINDOW_PATTERNS:
-                if pattern in normalized:
-                    return context_window
+            context_window = self._infer_context_window(candidate)
+            if context_window is not None:
+                return context_window
+        return None
+
+    def _infer_context_window(self, candidate: str | None) -> int | None:
+        if not candidate:
+            return None
+        normalized = candidate.lower()
+        for pattern, context_window in MODEL_CONTEXT_WINDOW_PATTERNS:
+            if pattern in normalized:
+                return context_window
         return None
 
     def _compact_with_budget_fit(
@@ -322,14 +341,12 @@ class CompactConversation(Transform):
         """Generate a summary after deterministic preprocessing."""
         edited_messages = self._apply_context_edit(messages)
         microcompacted_messages = self._apply_microcompact(edited_messages, pressure="high")
-        preserved_artifacts = self._extract_preserved_artifacts(microcompacted_messages)
 
         template = self._build_prompt_template()
         try:
-            raw_summary = self._compaction_llm().generate(
-                messages=microcompacted_messages,
+            return self._generate_summary_with_cap(
+                list(microcompacted_messages),
                 template=template,
-                preserved_artifacts=preserved_artifacts,
             )
         except CompactionConfigurationError:
             raise
@@ -338,7 +355,214 @@ class CompactConversation(Transform):
             raise CompactionExecutionError(
                 f"Compaction failed while summarizing {len(messages)} messages"
             ) from exc
+
+    def _generate_summary_with_cap(
+        self,
+        messages: list[Message],
+        *,
+        template: PromptTemplate,
+    ) -> str:
+        compactor_prompt_budget = self._resolve_compactor_prompt_budget()
+        current_messages = list(messages)
+
+        if compactor_prompt_budget is not None:
+            current_messages = self._ensure_messages_fit_prompt_budget(
+                current_messages,
+                template=template,
+                compactor_prompt_budget=compactor_prompt_budget,
+            )
+            while (
+                len(current_messages) > 1
+                and self._estimate_compactor_prompt_tokens(
+                    current_messages,
+                    template=template,
+                )
+                > compactor_prompt_budget
+            ):
+                current_messages = self._summarize_message_chunks(
+                    current_messages,
+                    template=template,
+                    compactor_prompt_budget=compactor_prompt_budget,
+                )
+                current_messages = self._ensure_messages_fit_prompt_budget(
+                    current_messages,
+                    template=template,
+                    compactor_prompt_budget=compactor_prompt_budget,
+                )
+
+            final_prompt_tokens = self._estimate_compactor_prompt_tokens(
+                current_messages,
+                template=template,
+            )
+            if final_prompt_tokens > compactor_prompt_budget:
+                raise CompactionExecutionError(
+                    "Compaction prompt exceeds the configured compactor input budget "
+                    f"({final_prompt_tokens} > {compactor_prompt_budget})."
+                )
+
+        preserved_artifacts = self._extract_preserved_artifacts(current_messages)
+        raw_summary = self._compaction_llm().generate(
+            messages=current_messages,
+            template=template,
+            preserved_artifacts=preserved_artifacts,
+        )
         return self._finalize_summary_output(raw_summary)
+
+    def _resolve_compactor_prompt_budget(self) -> int | None:
+        compactor_context_window = self._infer_context_window(self.model)
+        if compactor_context_window is None:
+            return None
+        reserved_output_tokens = min(
+            DEFAULT_RESERVED_OUTPUT_TOKENS,
+            max(1, compactor_context_window // 4),
+        )
+        return max(1, compactor_context_window - reserved_output_tokens)
+
+    def _estimate_compactor_prompt_tokens(
+        self,
+        messages: Sequence[Message],
+        *,
+        template: PromptTemplate,
+    ) -> int:
+        prompt = self._build_compactor_prompt(messages, template=template)
+        return count_message_tokens(prompt, self.model)
+
+    def _build_compactor_prompt(
+        self,
+        messages: Sequence[Message],
+        *,
+        template: PromptTemplate,
+    ) -> list[Message]:
+        preserved_artifacts = self._extract_preserved_artifacts(messages)
+        return self._compaction_llm().build_prompt(
+            messages=messages,
+            template=template,
+            preserved_artifacts=preserved_artifacts,
+        )
+
+    def _summarize_message_chunks(
+        self,
+        messages: list[Message],
+        *,
+        template: PromptTemplate,
+        compactor_prompt_budget: int,
+    ) -> list[Message]:
+        chunks = self._chunk_messages_for_prompt_budget(
+            messages,
+            template=template,
+            compactor_prompt_budget=compactor_prompt_budget,
+        )
+        if len(chunks) == 1 and len(messages) > 1:
+            midpoint = max(1, len(messages) // 2)
+            chunks = [messages[:midpoint], messages[midpoint:]]
+
+        summarized_chunks: list[Message] = []
+        for index, chunk in enumerate(chunks, start=1):
+            preserved_artifacts = self._extract_preserved_artifacts(chunk)
+            raw_summary = self._compaction_llm().generate(
+                messages=chunk,
+                template=template,
+                preserved_artifacts=preserved_artifacts,
+            )
+            summary = self._finalize_summary_output(raw_summary)
+            summarized_chunks.append(
+                {
+                    "role": "system",
+                    "content": f"Chunk {index} summary:\n{summary}",
+                }
+            )
+        return summarized_chunks
+
+    def _chunk_messages_for_prompt_budget(
+        self,
+        messages: Sequence[Message],
+        *,
+        template: PromptTemplate,
+        compactor_prompt_budget: int,
+    ) -> list[list[Message]]:
+        chunks: list[list[Message]] = []
+        current_chunk: list[Message] = []
+        for message in messages:
+            candidate_chunk = [*current_chunk, message]
+            if current_chunk and (
+                self._estimate_compactor_prompt_tokens(
+                    candidate_chunk,
+                    template=template,
+                )
+                > compactor_prompt_budget
+            ):
+                chunks.append(current_chunk)
+                current_chunk = [message]
+                continue
+            current_chunk = candidate_chunk
+
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks or [list(messages)]
+
+    def _ensure_messages_fit_prompt_budget(
+        self,
+        messages: list[Message],
+        *,
+        template: PromptTemplate,
+        compactor_prompt_budget: int,
+    ) -> list[Message]:
+        adjusted = list(messages)
+        for index, message in enumerate(adjusted):
+            if (
+                self._estimate_compactor_prompt_tokens(
+                    [message],
+                    template=template,
+                )
+                <= compactor_prompt_budget
+            ):
+                continue
+            adjusted[index] = self._truncate_message_for_prompt_budget(
+                message,
+                template=template,
+                compactor_prompt_budget=compactor_prompt_budget,
+            )
+        return adjusted
+
+    def _truncate_message_for_prompt_budget(
+        self,
+        message: Message,
+        *,
+        template: PromptTemplate,
+        compactor_prompt_budget: int,
+    ) -> Message:
+        content = get_text_content(message)
+        if not content:
+            return dict(message)
+
+        suffix = "\n...[truncated for compaction]"
+        best_content = suffix.strip()
+        low = 0
+        high = len(content)
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate_content = content[:midpoint].rstrip()
+            if midpoint < len(content):
+                candidate_content = (
+                    f"{candidate_content}{suffix}" if candidate_content else suffix.strip()
+                )
+            candidate_message = dict(message)
+            candidate_message["content"] = candidate_content
+            if (
+                self._estimate_compactor_prompt_tokens(
+                    [candidate_message],
+                    template=template,
+                )
+                <= compactor_prompt_budget
+            ):
+                best_content = candidate_content
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+
+        truncated_message = dict(message)
+        truncated_message["content"] = best_content
+        return truncated_message
 
     def _compaction_llm(self) -> CompactionLLM:
         if not self.model:
