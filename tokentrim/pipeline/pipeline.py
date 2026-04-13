@@ -60,6 +60,7 @@ class UnifiedPipeline:
             task_hint=request.task_hint,
             token_budget=effective_budget,
             memory_store=request.memory_store,
+            injector_model=request.injector_model,
             agent_aware_memory=request.agent_aware_memory,
             trace_store=request.trace_store,
             pipeline_tracer=request.pipeline_tracer,

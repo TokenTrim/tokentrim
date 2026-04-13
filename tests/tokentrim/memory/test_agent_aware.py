@@ -3,78 +3,140 @@ from __future__ import annotations
 import pytest
 
 from tokentrim.memory import (
+    FilesystemMemoryStore,
     InMemoryMemoryStore,
-    SESSION_MEMORY_TOOL_NAME,
+    SESSION_MEMORY_READ_TOOL_NAME,
+    SESSION_MEMORY_WRITE_TOOL_NAME,
     SessionMemoryToolHandler,
     build_agent_aware_memory_prompt,
-    build_session_memory_tool_result,
-    build_session_memory_tool,
-    execute_session_memory_tool,
+    build_session_memory_index_result,
+    build_session_memory_read_tool,
+    build_session_memory_record_result,
+    build_session_memory_tools,
+    build_session_memory_write_result,
+    build_session_memory_write_tool,
+    execute_session_memory_read_tool,
+    execute_session_memory_write_tool,
 )
 
 
-def test_build_session_memory_tool_exposes_standard_contract() -> None:
-    tool = build_session_memory_tool()
+def test_build_session_memory_tools_expose_read_and_write_contracts() -> None:
+    read_tool, write_tool = build_session_memory_tools()
 
-    assert tool["name"] == SESSION_MEMORY_TOOL_NAME
-    assert tool["input_schema"]["required"] == ["content", "kind"]
-    assert "Session memory may be injected later" in tool["description"]
-
-
-def test_build_agent_aware_memory_prompt_mentions_system_owned_injection() -> None:
-    prompt = build_agent_aware_memory_prompt()
-
-    assert "Session memory is available" in prompt
-    assert "Memory injection is controlled by the system" in prompt
+    assert read_tool["name"] == SESSION_MEMORY_READ_TOOL_NAME
+    assert write_tool["name"] == SESSION_MEMORY_WRITE_TOOL_NAME
+    assert write_tool["input_schema"]["required"] == ["title", "description", "content", "kind"]
 
 
-def test_execute_session_memory_tool_writes_session_memory() -> None:
+def test_build_agent_aware_memory_prompt_mentions_real_directory(tmp_path) -> None:
+    store = FilesystemMemoryStore(root_dir=tmp_path / "memory")
+    prompt = build_agent_aware_memory_prompt(memory_store=store, session_id="sess_1")
+
+    assert "file-backed session memory directory" in prompt
+    assert "MEMORY.md" in prompt
+    assert "write_session_memory" in prompt
+    assert "read_session_memory" in prompt
+    assert "When To Save" in prompt
+    assert "What Not To Save" in prompt
+    assert "Trust And Freshness" in prompt
+
+
+def test_execute_session_memory_write_tool_writes_session_memory() -> None:
     store = InMemoryMemoryStore()
 
-    record = execute_session_memory_tool(
+    record = execute_session_memory_write_tool(
         arguments={
-            "content": "Avoid destructive commands unless explicitly requested",
-            "kind": "constraint",
-            "dedupe_key": "avoid_destructive",
-            "reason": "User stated this as a constraint",
+            "title": "Repo Root",
+            "description": "Use repository root for debugging commands",
+            "content": "Run debugging commands from the repository root.",
+            "kind": "active_state",
+            "dedupe_key": "repo_root",
+            "reason": "Current task depends on repo-root relative paths",
         },
         memory_store=store,
         session_id="sess_1",
     )
 
     assert record.scope == "session"
-    assert record.kind == "constraint"
-    assert record.metadata == {"reason": "User stated this as a constraint"}
+    assert record.kind == "active_state"
+    assert record.metadata == {
+        "title": "Repo Root",
+        "description": "Use repository root for debugging commands",
+        "file_name": "Repo Root",
+        "reason": "Current task depends on repo-root relative paths",
+        "canonical_key": "repo_root",
+    }
 
 
-def test_execute_session_memory_tool_rejects_invalid_kind() -> None:
+def test_execute_session_memory_write_tool_rejects_invalid_kind() -> None:
     store = InMemoryMemoryStore()
 
     with pytest.raises(ValueError):
-        execute_session_memory_tool(
-            arguments={"content": "Remember this", "kind": "summary"},
+        execute_session_memory_write_tool(
+            arguments={
+                "title": "Bad",
+                "description": "Bad",
+                "content": "Remember this",
+                "kind": "summary",
+            },
             memory_store=store,
             session_id="sess_1",
         )
 
 
-def test_session_memory_tool_handler_dispatches_and_returns_standard_payload() -> None:
+def test_execute_session_memory_read_tool_returns_index_and_record() -> None:
+    store = InMemoryMemoryStore()
+    record = execute_session_memory_write_tool(
+        arguments={
+            "title": "Repo Root",
+            "description": "Use repository root for debugging commands",
+            "content": "Run debugging commands from the repository root.",
+            "kind": "active_state",
+        },
+        memory_store=store,
+        session_id="sess_1",
+    )
+
+    index_result = execute_session_memory_read_tool(
+        arguments={},
+        memory_store=store,
+        session_id="sess_1",
+    )
+    record_result = execute_session_memory_read_tool(
+        arguments={"memory_id": record.memory_id},
+        memory_store=store,
+        session_id="sess_1",
+    )
+
+    assert index_result["mode"] == "index"
+    assert "Repo Root" in str(index_result["content"])
+    assert record_result["mode"] == "record"
+    assert record_result["memory_id"] == record.memory_id
+
+
+def test_session_memory_tool_handler_dispatches_read_and_write() -> None:
     store = InMemoryMemoryStore()
     handler = SessionMemoryToolHandler(memory_store=store, session_id="sess_1")
 
-    result = handler.execute(
-        tool_name="remember",
+    write_result = handler.execute(
+        tool_name="write_session_memory",
         arguments={
-            "content": "Use repo root for command debugging",
+            "title": "Repo Root",
+            "description": "Use repository root for debugging commands",
+            "content": "Run debugging commands from the repository root.",
             "kind": "active_state",
             "dedupe_key": "repo_root",
         },
     )
+    read_result = handler.execute(
+        tool_name="read_session_memory",
+        arguments={},
+    )
 
-    assert result["ok"] is True
-    assert result["scope"] == "session"
-    assert result["kind"] == "active_state"
-    assert result["content"] == "Use repo root for command debugging"
+    assert write_result["ok"] is True
+    assert write_result["action"] == "write_session_memory"
+    assert read_result["ok"] is True
+    assert read_result["action"] == "read_session_memory"
 
 
 def test_session_memory_tool_handler_rejects_unknown_tool_name() -> None:
@@ -82,22 +144,26 @@ def test_session_memory_tool_handler_rejects_unknown_tool_name() -> None:
     handler = SessionMemoryToolHandler(memory_store=store, session_id="sess_1")
 
     with pytest.raises(ValueError):
-        handler.execute(
-            tool_name="other_tool",
-            arguments={"content": "x", "kind": "constraint"},
-        )
+        handler.execute(tool_name="other_tool", arguments={})
 
 
-def test_build_session_memory_tool_result_returns_serializable_payload() -> None:
+def test_session_memory_result_builders_are_serializable() -> None:
     store = InMemoryMemoryStore()
-    record = execute_session_memory_tool(
-        arguments={"content": "Prefer concise answers", "kind": "preference"},
+    record = execute_session_memory_write_tool(
+        arguments={
+            "title": "Repo Root",
+            "description": "Use repository root for debugging commands",
+            "content": "Run debugging commands from the repository root.",
+            "kind": "active_state",
+        },
         memory_store=store,
         session_id="sess_1",
     )
 
-    payload = build_session_memory_tool_result(record)
+    write_payload = build_session_memory_write_result(record)
+    index_payload = build_session_memory_index_result(memory_store=store, session_id="sess_1")
+    record_payload = build_session_memory_record_result(record)
 
-    assert payload["ok"] is True
-    assert payload["memory_id"] == record.memory_id
-    assert payload["dedupe_key"] is None
+    assert write_payload["memory_id"] == record.memory_id
+    assert index_payload["mode"] == "index"
+    assert record_payload["mode"] == "record"

@@ -22,6 +22,7 @@ class PipelineRequest:
     task_hint: str | None = None
     token_budget: int | None = None
     memory_store: MemoryStore | None = None
+    injector_model: str | None = None
     agent_aware_memory: bool = False
     trace_store: TraceStore | None = None
     pipeline_tracer: PipelineTracer | None = None
@@ -50,6 +51,7 @@ class ContextRequest(PipelineRequest):
             task_hint=None,
             token_budget=token_budget,
             memory_store=None,
+            injector_model=None,
             agent_aware_memory=False,
             trace_store=None,
             pipeline_tracer=None,
@@ -77,6 +79,7 @@ class ToolsRequest(PipelineRequest):
             task_hint=task_hint,
             token_budget=token_budget,
             memory_store=None,
+            injector_model=None,
             agent_aware_memory=False,
             trace_store=None,
             pipeline_tracer=None,

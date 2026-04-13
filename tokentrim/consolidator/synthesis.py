@@ -210,9 +210,7 @@ def _collect_command_failure_insight_candidates(
                 continue
             issue_summary = _summarize_failure_output(terminal_output)
             repair_summary = _summarize_repair(analysis=analysis, command=command)
-            signature = _normalize_signature(
-                f"{trace.workflow_name}|{issue_summary}|{repair_summary}"
-            )
+            signature = _normalize_signature(f"{trace.workflow_name}|{issue_summary}")
             grouped[signature].append((trace, span, issue_summary, repair_summary, command))
 
     candidates: list[TracePatternCandidate] = []

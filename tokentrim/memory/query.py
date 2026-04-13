@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from tokentrim.memory.freshness import memory_age_days, memory_freshness_bucket
 from tokentrim.memory.records import MemoryQuery, MemoryRecord, MemoryScope
 
 _TOKEN_RE = re.compile(r"[a-z0-9_./-]{3,}")
@@ -47,7 +48,15 @@ def select_memories(
             record.memory_id,
         )
     )
-    return tuple(filtered[: query.k])
+    deduped: list[MemoryRecord] = []
+    seen_canonical_keys: set[str] = set()
+    for record in filtered:
+        canonical_key = memory_canonical_key(record)
+        if canonical_key in seen_canonical_keys:
+            continue
+        seen_canonical_keys.add(canonical_key)
+        deduped.append(record)
+    return tuple(deduped[: query.k])
 
 
 def score_memory_record(
@@ -58,9 +67,14 @@ def score_memory_record(
 ) -> float:
     score = float(scope_weights.get(record.scope, 0.0)) + record.salience
     if query_tokens:
-        memory_tokens = tokenize_text(f"{record.kind} {record.content}")
+        memory_tokens = tokenize_text(_record_search_text(record))
         overlap = len(query_tokens & memory_tokens)
         score += overlap * 0.5
+    freshness_bucket = memory_freshness_bucket(record.updated_at)
+    if freshness_bucket == "aging":
+        score -= 0.25
+    elif freshness_bucket == "stale":
+        score -= 0.75
     if record.status != "active":
         score -= 10.0
     return score
@@ -77,3 +91,37 @@ def timestamp_score(value: str) -> float:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
+
+
+def memory_canonical_key(record: MemoryRecord) -> str:
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    raw_key = metadata.get("canonical_key")
+    if isinstance(raw_key, str) and raw_key.strip():
+        return raw_key.strip().lower()
+    if isinstance(record.dedupe_key, str) and record.dedupe_key.strip():
+        return record.dedupe_key.strip().lower()
+    raw_title = metadata.get("title")
+    title = raw_title.strip().lower() if isinstance(raw_title, str) and raw_title.strip() else record.kind.lower()
+    return f"{record.scope}:{record.subject_id}:{record.kind}:{title}"
+
+
+def _record_search_text(record: MemoryRecord) -> str:
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    title = metadata.get("title") if isinstance(metadata.get("title"), str) else ""
+    description = metadata.get("description") if isinstance(metadata.get("description"), str) else ""
+    canonical_key = metadata.get("canonical_key") if isinstance(metadata.get("canonical_key"), str) else ""
+    age = str(memory_age_days(record.updated_at))
+    return " ".join(
+        part
+        for part in (
+            record.kind,
+            record.content,
+            title,
+            description,
+            record.dedupe_key or "",
+            canonical_key,
+            " ".join(record.source_refs),
+            age,
+        )
+        if part
+    )

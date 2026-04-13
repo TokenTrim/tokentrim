@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 from tokentrim.memory import MemoryQuery
 from tokentrim.memory.agent_aware import (
-    SESSION_MEMORY_TOOL_NAME,
     build_agent_aware_memory_prompt,
-    build_session_memory_tool,
+    build_session_memory_tools,
 )
+from tokentrim.memory.selector import select_memory_candidates
 from tokentrim.memory.formatting import render_injected_memory_message
 from tokentrim.memory.records import MemoryRecord
 from tokentrim.pipeline.requests import PipelineRequest
@@ -21,24 +21,25 @@ from tokentrim.types.tool import Tool
 class AgentAwareMemory(Transform):
     """Expose Tokentrim's standard session-memory capability to the agent."""
 
-    tool_name: str = SESSION_MEMORY_TOOL_NAME
-
     @property
     def name(self) -> str:
         return "agent_aware_memory"
 
     def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
-        if request.memory_store is None:
+        if request.memory_store is None or request.session_id is None:
             return state
-        prompt = build_agent_aware_memory_prompt(tool_name=self.tool_name)
-        tool = build_session_memory_tool(tool_name=self.tool_name)
+        prompt = build_agent_aware_memory_prompt(
+            memory_store=request.memory_store,
+            session_id=request.session_id,
+        )
+        tools = build_session_memory_tools()
         return PipelineState(
             context=_insert_system_message(
                 state.context,
                 message_content=prompt,
                 slot="secondary_system",
             ),
-            tools=_upsert_tool(state.tools, tool=tool),
+            tools=_upsert_tools(state.tools, tools=tools),
         )
 
 
@@ -89,8 +90,20 @@ class InjectMemory(Transform):
         if not candidates:
             return state
 
+        selected_candidates = select_memory_candidates(
+            memory_store=request.memory_store,
+            candidates=tuple(candidate for candidate in candidates if isinstance(candidate, MemoryRecord)),
+            session_id=request.session_id,
+            user_id=request.user_id,
+            org_id=request.org_id,
+            text_query=text_query,
+            selector_model=request.injector_model,
+        )
+        if not selected_candidates:
+            return state
+
         memory_content = _build_memory_message_content(
-            candidates=candidates,
+            candidates=selected_candidates,
             current_messages=state.context,
             token_budget=request.token_budget,
             max_memory_tokens=self.max_memory_tokens,
@@ -165,7 +178,9 @@ def _insert_system_message(
     return [current_messages[0], prompt_message, *current_messages[1:]]
 
 
-def _upsert_tool(current_tools: list[Tool], *, tool: Tool) -> list[Tool]:
-    tools = [existing for existing in current_tools if existing.get("name") != tool.get("name")]
-    tools.append(tool)
-    return tools
+def _upsert_tools(current_tools: list[Tool], *, tools: tuple[Tool, ...]) -> list[Tool]:
+    next_tools = list(current_tools)
+    for tool in tools:
+        next_tools = [existing for existing in next_tools if existing.get("name") != tool.get("name")]
+        next_tools.append(tool)
+    return next_tools

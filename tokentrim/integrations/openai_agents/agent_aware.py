@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from tokentrim.memory import SessionMemoryToolHandler
-from tokentrim.memory.agent_aware import SESSION_MEMORY_TOOL_NAME
+from tokentrim.memory.agent_aware import (
+    SESSION_MEMORY_READ_TOOL_NAME,
+    SESSION_MEMORY_WRITE_TOOL_NAME,
+)
 from tokentrim.types.message import Message
 
 
 @dataclass(frozen=True, slots=True)
 class OpenAIAgentsSessionMemoryBridge:
-    """Adapter helper that turns remember tool calls into OpenAI-Agents-style tool results."""
+    """Adapter helper that turns Tokentrim session-memory tool calls into OpenAI-Agents-style tool results."""
 
     handler: SessionMemoryToolHandler
 
@@ -79,13 +82,13 @@ def build_openai_agents_session_memory_bridge(
     *,
     memory_store: Any,
     session_id: str,
-    tool_name: str = SESSION_MEMORY_TOOL_NAME,
 ) -> OpenAIAgentsSessionMemoryBridge:
     return OpenAIAgentsSessionMemoryBridge(
         handler=SessionMemoryToolHandler(
             memory_store=memory_store,
             session_id=session_id,
-            tool_name=tool_name,
+            read_tool_name=SESSION_MEMORY_READ_TOOL_NAME,
+            write_tool_name=SESSION_MEMORY_WRITE_TOOL_NAME,
         )
     )
 

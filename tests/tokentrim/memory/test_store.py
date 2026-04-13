@@ -113,14 +113,19 @@ def test_filesystem_store_round_trips_markdown_records(tmp_path: Path) -> None:
             content="Persist this fact",
             kind="task_fact",
             dedupe_key="fact_1",
-            metadata={"source": "test"},
+            metadata={"source": "test", "title": "Persisted Fact", "description": "Useful task fact"},
         ),
     )
 
     listed = store.list_memories(scope="session", subject_id="sess_1")
 
     assert listed == (created,)
-    assert (tmp_path / "memory" / "session" / "sess_1" / f"{created.memory_id}.md").exists()
+    assert (tmp_path / "memory" / "session" / "sess_1" / "persisted-fact.md").exists()
+    entrypoint = tmp_path / "memory" / "session" / "sess_1" / "MEMORY.md"
+    assert entrypoint.exists()
+    entrypoint_text = entrypoint.read_text(encoding="utf-8")
+    assert "Persisted Fact" in entrypoint_text
+    assert "## Task Fact" in entrypoint_text
 
 
 def test_filesystem_store_archives_and_deletes_records(tmp_path: Path) -> None:
@@ -136,3 +141,22 @@ def test_filesystem_store_archives_and_deletes_records(tmp_path: Path) -> None:
 
     store.delete_memory(memory_id=created.memory_id)
     assert store.list_memories(scope="session", subject_id="sess_1") == ()
+
+
+def test_filesystem_store_finds_memory_by_id_even_with_semantic_filename(tmp_path: Path) -> None:
+    store = FilesystemMemoryStore(root_dir=tmp_path / "memory")
+    created = store.write_session_memory(
+        session_id="sess_1",
+        write=MemoryWrite(
+            content="Persist this fact",
+            kind="task_fact",
+            dedupe_key="fact_1",
+            metadata={"title": "Semantic file", "description": "Uses semantic filename"},
+        ),
+    )
+
+    store.archive_memory(memory_id=created.memory_id)
+    archived = store.list_memories(scope="session", subject_id="sess_1")[0]
+
+    assert archived.memory_id == created.memory_id
+    assert archived.status == "archived"

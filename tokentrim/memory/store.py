@@ -124,6 +124,16 @@ class FilesystemMemoryStore(MemoryStore):
         self._root_dir = Path(root_dir)
         self._root_dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def root_dir(self) -> Path:
+        return self._root_dir
+
+    def scope_dir(self, *, scope: MemoryScope, subject_id: str) -> Path:
+        return self._root_dir / scope / subject_id
+
+    def entrypoint_path(self, *, scope: MemoryScope, subject_id: str) -> Path:
+        return self.scope_dir(scope=scope, subject_id=subject_id) / "MEMORY.md"
+
     def list_memories(
         self,
         *,
@@ -140,7 +150,11 @@ class FilesystemMemoryStore(MemoryStore):
         return _sorted_records(records, limit=limit)
 
     def query_memories(self, query: MemoryQuery) -> tuple[MemoryRecord, ...]:
-        records = [self._read_record(path) for path in self._root_dir.rglob("*.md")]
+        records = [
+            self._read_record(path)
+            for path in self._root_dir.rglob("*.md")
+            if path.name != "MEMORY.md"
+        ]
         return select_memories(records, query=query)
 
     def write_session_memory(self, *, session_id: str, write: MemoryWrite) -> MemoryRecord:
@@ -166,9 +180,13 @@ class FilesystemMemoryStore(MemoryStore):
         return self.upsert_memory(_build_session_record(session_id=session_id, write=write))
 
     def upsert_memory(self, record: MemoryRecord) -> MemoryRecord:
-        path = self._record_path(record.scope, record.subject_id, record.memory_id)
+        existing = self._find_by_memory_id(record.memory_id)
+        path = self._record_path(record)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_serialize_record(record), encoding="utf-8")
+        if existing is not None and existing[0] != path:
+            existing[0].unlink(missing_ok=True)
+        self._refresh_entrypoint(scope=record.scope, subject_id=record.subject_id)
         return record
 
     def archive_memory(self, *, memory_id: str) -> None:
@@ -180,30 +198,51 @@ class FilesystemMemoryStore(MemoryStore):
             _serialize_record(replace(record, status="archived", updated_at=utc_now_iso())),
             encoding="utf-8",
         )
+        self._refresh_entrypoint(scope=record.scope, subject_id=record.subject_id)
 
     def delete_memory(self, *, memory_id: str) -> None:
         existing = self._find_by_memory_id(memory_id)
         if existing is None:
             return
-        path, _ = existing
+        path, record = existing
         path.unlink(missing_ok=True)
+        self._refresh_entrypoint(scope=record.scope, subject_id=record.subject_id)
 
-    def _record_path(self, scope: MemoryScope, subject_id: str, memory_id: str) -> Path:
-        return self._root_dir / scope / subject_id / f"{memory_id}.md"
+    def _record_path(self, record: MemoryRecord) -> Path:
+        return self.scope_dir(scope=record.scope, subject_id=record.subject_id) / f"{_record_stem(record)}.md"
 
     def _read_scope_records(self, *, scope: MemoryScope, subject_id: str) -> tuple[MemoryRecord, ...]:
         directory = self._root_dir / scope / subject_id
         if not directory.exists():
             return tuple()
-        return tuple(self._read_record(path) for path in sorted(directory.glob("*.md")))
+        return tuple(
+            self._read_record(path)
+            for path in sorted(directory.glob("*.md"))
+            if path.name != "MEMORY.md"
+        )
 
     def _find_by_memory_id(self, memory_id: str) -> tuple[Path, MemoryRecord] | None:
-        for path in self._root_dir.rglob(f"{memory_id}.md"):
-            return path, self._read_record(path)
+        for path in self._root_dir.rglob("*.md"):
+            if path.name == "MEMORY.md":
+                continue
+            record = self._read_record(path)
+            if record.memory_id == memory_id:
+                return path, record
         return None
 
     def _read_record(self, path: Path) -> MemoryRecord:
         return _deserialize_record(path.read_text(encoding="utf-8"))
+
+    def _refresh_entrypoint(self, *, scope: MemoryScope, subject_id: str) -> None:
+        directory = self.scope_dir(scope=scope, subject_id=subject_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        records = [
+            record
+            for record in self._read_scope_records(scope=scope, subject_id=subject_id)
+            if record.status == "active"
+        ]
+        entrypoint = self.entrypoint_path(scope=scope, subject_id=subject_id)
+        entrypoint.write_text(_render_entrypoint(records), encoding="utf-8")
 
 
 def _build_session_record(*, session_id: str, write: MemoryWrite) -> MemoryRecord:
@@ -313,3 +352,70 @@ def _deserialize_record(payload: str) -> MemoryRecord:
         dedupe_key=frontmatter.get("dedupe_key") if isinstance(frontmatter.get("dedupe_key"), str) else None,
         metadata=metadata if isinstance(metadata, dict) else None,
     )
+
+
+def _render_entrypoint(records: list[MemoryRecord]) -> str:
+    lines = ["# MEMORY", ""]
+    if not records:
+        lines.append("_No active memories yet._")
+        return "\n".join(lines)
+    grouped: dict[str, list[MemoryRecord]] = {
+        "constraint": [],
+        "active_state": [],
+        "task_fact": [],
+        "decision": [],
+        "preference": [],
+        "other": [],
+    }
+    for record in sorted(records, key=lambda item: (item.updated_at, item.memory_id), reverse=True):
+        grouped[record.kind if record.kind in grouped else "other"].append(record)
+    for group_name, group_records in grouped.items():
+        if not group_records:
+            continue
+        lines.append(f"## {group_name.replace('_', ' ').title()}")
+        lines.append("")
+        for record in group_records:
+            lines.append(
+                f"- [{_record_title(record)}]({_record_stem(record)}.md) — {_record_description(record)} "
+                f"(updated {record.updated_at})"
+            )
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _record_stem(record: MemoryRecord) -> str:
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    raw_file_name = metadata.get("file_name") or metadata.get("title")
+    if isinstance(raw_file_name, str) and raw_file_name.strip():
+        sanitized = _sanitize_memory_file_name(raw_file_name)
+        if sanitized:
+            return sanitized
+    return record.memory_id
+
+
+def _record_title(record: MemoryRecord) -> str:
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    raw_title = metadata.get("title")
+    if isinstance(raw_title, str) and raw_title.strip():
+        return raw_title.strip()
+    return record.kind.replace("_", " ").title()
+
+
+def _record_description(record: MemoryRecord) -> str:
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    raw_description = metadata.get("description")
+    if isinstance(raw_description, str) and raw_description.strip():
+        return raw_description.strip()
+    content = " ".join(record.content.split())
+    return content[:117] + "..." if len(content) > 120 else content
+
+
+def _sanitize_memory_file_name(value: str) -> str:
+    normalized = "".join(
+        character.lower() if character.isalnum() else "-"
+        for character in value.strip()
+    )
+    collapsed = "-".join(part for part in normalized.split("-") if part)
+    return collapsed or ""

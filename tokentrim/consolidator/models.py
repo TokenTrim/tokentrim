@@ -143,8 +143,9 @@ def apply_consolidation_plan(
         if upsert.scope not in {"user", "org"}:
             raise ValueError("Consolidation upserts may target only user or org scope.")
         now = utc_now_iso()
+        existing_record = _find_existing_durable_target(memory_store=memory_store, upsert=upsert)
         record = MemoryRecord(
-            memory_id=upsert.memory_id or _generate_memory_id(upsert.scope),
+            memory_id=upsert.memory_id or (existing_record.memory_id if existing_record is not None else _generate_memory_id(upsert.scope)),
             scope=upsert.scope,
             subject_id=upsert.subject_id,
             kind=upsert.write.kind,
@@ -152,12 +153,19 @@ def apply_consolidation_plan(
             salience=upsert.write.salience,
             status="active",
             source_refs=upsert.write.source_refs,
-            created_at=now,
+            created_at=existing_record.created_at if existing_record is not None else now,
             updated_at=now,
             dedupe_key=upsert.write.dedupe_key,
             metadata=upsert.write.metadata,
         )
         upserted.append(memory_store.upsert_memory(record))
+        for duplicate in _find_overlapping_durable_memories(
+            memory_store=memory_store,
+            upsert=upsert,
+            surviving_memory_id=record.memory_id,
+        ):
+            memory_store.archive_memory(memory_id=duplicate.memory_id)
+            archived_memory_ids.append(duplicate.memory_id)
 
     for archive in (*plan.user_archives, *plan.org_archives):
         memory_store.archive_memory(memory_id=archive.memory_id)
@@ -240,6 +248,92 @@ def _dedupe_upserts(upserts: object) -> tuple[MemoryUpsert, ...]:
         seen.add(key)
         ordered.append(upsert)
     return tuple(ordered)
+
+
+def _find_existing_durable_target(
+    *,
+    memory_store: MemoryStore,
+    upsert: MemoryUpsert,
+) -> MemoryRecord | None:
+    best_overlap: MemoryRecord | None = None
+    for memory in memory_store.list_memories(scope=upsert.scope, subject_id=upsert.subject_id):
+        if memory.status != "active":
+            continue
+        if _durable_signature(memory=memory) == _durable_signature_from_upsert(upsert):
+            return memory
+        if _durable_overlap_signature(memory=memory) == _durable_overlap_signature_from_upsert(upsert):
+            if best_overlap is None or memory.updated_at > best_overlap.updated_at:
+                best_overlap = memory
+    return best_overlap
+
+
+def _find_overlapping_durable_memories(
+    *,
+    memory_store: MemoryStore,
+    upsert: MemoryUpsert,
+    surviving_memory_id: str,
+) -> tuple[MemoryRecord, ...]:
+    duplicates: list[MemoryRecord] = []
+    target_signature = _durable_signature_from_upsert(upsert)
+    for memory in memory_store.list_memories(scope=upsert.scope, subject_id=upsert.subject_id):
+        if memory.memory_id == surviving_memory_id or memory.status != "active":
+            continue
+        if (
+            _durable_signature(memory=memory) == target_signature
+            or _durable_overlap_signature(memory=memory) == _durable_overlap_signature_from_upsert(upsert)
+        ):
+            duplicates.append(memory)
+    return tuple(duplicates)
+
+
+def _durable_signature_from_upsert(upsert: MemoryUpsert) -> tuple[object, ...]:
+    metadata = upsert.write.metadata if isinstance(upsert.write.metadata, dict) else {}
+    return (
+        upsert.scope,
+        upsert.subject_id,
+        upsert.write.kind,
+        upsert.write.dedupe_key,
+        metadata.get("trace_pattern"),
+        metadata.get("workflow_name"),
+        metadata.get("issue_summary"),
+    )
+
+
+def _durable_signature(*, memory: MemoryRecord) -> tuple[object, ...]:
+    metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    return (
+        memory.scope,
+        memory.subject_id,
+        memory.kind,
+        memory.dedupe_key,
+        metadata.get("trace_pattern"),
+        metadata.get("workflow_name"),
+        metadata.get("issue_summary"),
+    )
+
+
+def _durable_overlap_signature_from_upsert(upsert: MemoryUpsert) -> tuple[object, ...]:
+    metadata = upsert.write.metadata if isinstance(upsert.write.metadata, dict) else {}
+    return (
+        upsert.scope,
+        upsert.subject_id,
+        upsert.write.kind,
+        metadata.get("trace_pattern"),
+        metadata.get("workflow_name"),
+        metadata.get("issue_summary"),
+    )
+
+
+def _durable_overlap_signature(*, memory: MemoryRecord) -> tuple[object, ...]:
+    metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    return (
+        memory.scope,
+        memory.subject_id,
+        memory.kind,
+        metadata.get("trace_pattern"),
+        metadata.get("workflow_name"),
+        metadata.get("issue_summary"),
+    )
 
 
 def _dedupe_archives(archives: object) -> tuple[MemoryArchive, ...]:

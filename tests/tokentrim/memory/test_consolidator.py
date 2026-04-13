@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from tokentrim.consolidator import (
     AgenticConsolidatorAgent,
     ConsolidationInput,
-    ConsolidationJobConfig,
     ConsolidationPlan,
+    ConsolidationJobConfig,
     ConsolidatorAgent,
     DeterministicConsolidatorAgent,
     MemoryUpsert,
@@ -22,6 +22,7 @@ from tokentrim.consolidator import (
     parse_consolidation_plan_response,
     run_session_consolidation,
     serialize_consolidation_input,
+    apply_consolidation_plan,
 )
 from tokentrim.memory import (
     InMemoryMemoryStore,
@@ -373,6 +374,118 @@ def test_offline_consolidator_uses_injected_agent_contract() -> None:
     stored_user_memories = memory_store.list_memories(scope="user", subject_id="user_1")
     assert len(stored_user_memories) == 1
     assert stored_user_memories[0].dedupe_key == "pref:deterministic_consolidator"
+
+
+def test_apply_consolidation_plan_reuses_existing_durable_memory_for_same_signature() -> None:
+    memory_store = InMemoryMemoryStore()
+    existing = memory_store.upsert_memory(
+        MemoryRecord(
+            memory_id="user_mem_existing",
+            scope="user",
+            subject_id="user_1",
+            kind="failure_recovery",
+            content="Old repair heuristic",
+            dedupe_key="trace:user:code_agent_pytest_missing",
+            metadata={
+                "trace_pattern": "command_failure_insight",
+                "workflow_name": "code_agent",
+                "issue_summary": "[exit_code] 100",
+            },
+        )
+    )
+
+    result = apply_consolidation_plan(
+        plan=ConsolidationPlan(
+            user_upserts=(
+                MemoryUpsert(
+                    scope="user",
+                    subject_id="user_1",
+                    memory_id=None,
+                    write=MemoryWrite(
+                        content="Updated repair heuristic",
+                        kind="failure_recovery",
+                        dedupe_key="trace:user:code_agent_pytest_missing",
+                        metadata={
+                            "trace_pattern": "command_failure_insight",
+                            "workflow_name": "code_agent",
+                            "issue_summary": "[exit_code] 100",
+                        },
+                    ),
+                ),
+            ),
+        ),
+        memory_store=memory_store,
+    )
+
+    assert result.upserted[0].memory_id == existing.memory_id
+    stored = memory_store.list_memories(scope="user", subject_id="user_1")
+    assert len(stored) == 1
+    assert stored[0].content == "Updated repair heuristic"
+
+
+def test_apply_consolidation_plan_archives_overlapping_durable_memories() -> None:
+    memory_store = InMemoryMemoryStore()
+    survivor = memory_store.upsert_memory(
+        MemoryRecord(
+            memory_id="user_mem_existing",
+            scope="user",
+            subject_id="user_1",
+            kind="failure_recovery",
+            content="Old repair heuristic",
+            dedupe_key="trace:user:code_agent_issue_a",
+            metadata={
+                "trace_pattern": "command_failure_insight",
+                "workflow_name": "code_agent",
+                "issue_summary": "OCI runtime exec failed",
+            },
+        )
+    )
+    duplicate = memory_store.upsert_memory(
+        MemoryRecord(
+            memory_id="user_mem_duplicate",
+            scope="user",
+            subject_id="user_1",
+            kind="failure_recovery",
+            content="Another variant",
+            dedupe_key="trace:user:code_agent_issue_b",
+            metadata={
+                "trace_pattern": "command_failure_insight",
+                "workflow_name": "code_agent",
+                "issue_summary": "OCI runtime exec failed",
+            },
+        )
+    )
+
+    result = apply_consolidation_plan(
+        plan=ConsolidationPlan(
+            user_upserts=(
+                MemoryUpsert(
+                    scope="user",
+                    subject_id="user_1",
+                    memory_id=None,
+                    write=MemoryWrite(
+                        content="Canonical repair heuristic",
+                        kind="failure_recovery",
+                        dedupe_key="trace:user:code_agent_oci_runtime_exec_failed",
+                        metadata={
+                            "trace_pattern": "command_failure_insight",
+                            "workflow_name": "code_agent",
+                            "issue_summary": "OCI runtime exec failed",
+                        },
+                    ),
+                ),
+            ),
+        ),
+        memory_store=memory_store,
+    )
+
+    stored = memory_store.list_memories(scope="user", subject_id="user_1")
+    active = [memory for memory in stored if memory.status == "active"]
+    archived = [memory for memory in stored if memory.status == "archived"]
+
+    assert result.upserted[0].memory_id == survivor.memory_id
+    assert any(memory.memory_id == duplicate.memory_id for memory in archived)
+    assert len(active) == 1
 
 
 def test_build_consolidator_system_prompt_describes_boundaries() -> None:

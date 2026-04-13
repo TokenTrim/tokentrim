@@ -304,12 +304,12 @@ def test_compose_apply_can_enable_agent_aware_memory_mode() -> None:
         org_id="org_1",
         memory_store=memory_store,
         agent_aware_memory=True,
-        token_budget=500,
+        token_budget=1200,
     )
 
     assert result.context[0]["role"] == "system"
-    assert "Session memory is available" in str(result.context[0]["content"])
-    assert any(tool["name"] == "remember" for tool in result.tools)
+    assert "file-backed session memory directory" in str(result.context[0]["content"])
+    assert {tool["name"] for tool in result.tools} == {"read_session_memory", "write_session_memory"}
 
 
 def test_tokentrim_exposes_explicit_session_memory_write_helpers() -> None:

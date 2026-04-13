@@ -119,5 +119,5 @@ def test_agent_aware_memory_adds_policy_prompt_and_tool() -> None:
     result = step.run(state, _request(memory_store=store))
 
     assert result.context[0]["role"] == "system"
-    assert "Session memory is available" in str(result.context[0]["content"])
-    assert result.tools[0]["name"] == "remember"
+    assert "file-backed session memory directory" in str(result.context[0]["content"])
+    assert {tool["name"] for tool in result.tools} == {"read_session_memory", "write_session_memory"}
