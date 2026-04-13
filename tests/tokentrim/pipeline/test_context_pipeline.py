@@ -39,27 +39,28 @@ def test_pipeline_runs_steps_in_order() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
+        org_id=None,
         token_budget=1000,
         steps=(
             RecorderStep("filter", "filter", calls),
             RecorderStep("compaction", "compaction", calls),
-            RecorderStep("rlm", "rlm", calls),
+            RecorderStep("memory_review", "memory_review", calls),
         ),
     )
 
     result = pipeline.run(request)
 
-    assert calls == ["filter", "compaction", "rlm"]
+    assert calls == ["filter", "compaction", "memory_review"]
     assert [message["content"] for message in result.context] == [
         "hello",
         "filter",
         "compaction",
-        "rlm",
+        "memory_review",
     ]
     assert [trace.step_name for trace in result.trace.steps] == [
         "filter",
         "compaction",
-        "rlm",
+        "memory_review",
     ]
     assert isinstance(result.context, tuple)
     assert result.trace.id
@@ -75,6 +76,7 @@ def test_pipeline_skips_disabled_steps() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
+        org_id=None,
         token_budget=1000,
         steps=(RecorderStep("filter", "filter", calls),),
     )
@@ -94,6 +96,7 @@ def test_pipeline_does_not_mutate_input_messages() -> None:
         messages=tuple(original),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(RecorderStep("filter", "filter", []),),
     )
@@ -112,6 +115,7 @@ def test_pipeline_result_is_independent_from_input_dicts() -> None:
         messages=tuple(original),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(),
     )
@@ -130,6 +134,7 @@ def test_pipeline_raises_when_final_budget_is_exceeded() -> None:
         messages=({"role": "user", "content": "x" * 80},),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=5,
         steps=(),
     )
@@ -148,6 +153,7 @@ def test_pipeline_raises_for_unknown_steps() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(object(),),
     )
@@ -178,8 +184,10 @@ def test_pipeline_runs_mixed_steps_against_shared_request() -> None:
         tools=(),
         user_id="user",
         session_id="session",
+        org_id="org",
         task_hint="investigate",
         token_budget=1000,
+        memory_store=None,
         steps=(RecorderStep("filter", "filter", []), ToolRecorderStep()),
     )
 
@@ -200,6 +208,7 @@ def test_pipeline_uses_auto_budget_from_compaction_step(monkeypatch: pytest.Monk
         messages=tuple({"role": "user", "content": "x" * 80} for _ in range(6)),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(
             CompactConversation(
@@ -227,6 +236,7 @@ def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget(
         messages=({"role": "user", "content": "x" * 400},),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(
             CompactConversation(

@@ -12,15 +12,16 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 from tokentrim.core.llm_client import generate_text
-from tokentrim.transforms.rlm.error import RLMExecutionError
+from tokentrim.consolidator.errors import ConsolidatorRuntimeError
 from tokentrim.tracing.records import TokentrimSpanRecord, TokentrimTraceRecord
 from tokentrim.types.message import Message
 
 _BLOCKED_BUILTINS = {"eval", "exec", "compile", "input", "globals", "locals"}
 _RESERVED_NAMES = {
     "context",
+    "bundle",
     "llm_query",
-    "rlm_query",
+    "bundle_query",
     "FINAL",
     "FINAL_VAR",
     "SHOW_VARS",
@@ -32,30 +33,30 @@ _SAFE_BUILTINS = {
     for name, value in builtins.__dict__.items()
     if name not in _BLOCKED_BUILTINS
 }
-_PREVIEW_CHAR_LIMIT = max(1, int(os.environ.get("TOKENTRIM_RLM_PREVIEW_CHARS", "2000")))
-_TEXT_CHAR_LIMIT = max(1, int(os.environ.get("TOKENTRIM_RLM_TEXT_CHARS", "12000")))
-_GREP_MATCH_LIMIT = max(1, int(os.environ.get("TOKENTRIM_RLM_GREP_MATCH_LIMIT", "5")))
+_PREVIEW_CHAR_LIMIT = max(1, int(os.environ.get("TOKENTRIM_CONSOLIDATOR_PREVIEW_CHARS", "2000")))
+_TEXT_CHAR_LIMIT = max(1, int(os.environ.get("TOKENTRIM_CONSOLIDATOR_TEXT_CHARS", "12000")))
+_GREP_MATCH_LIMIT = max(1, int(os.environ.get("TOKENTRIM_CONSOLIDATOR_GREP_MATCH_LIMIT", "5")))
 _EXEC_RESULT_CHAR_LIMIT = max(
-    1, int(os.environ.get("TOKENTRIM_RLM_EXEC_RESULT_CHARS", "4000"))
+    1, int(os.environ.get("TOKENTRIM_CONSOLIDATOR_EXEC_RESULT_CHARS", "4000"))
 )
 _EXCERPT_CONTEXT = 180
 
 _SYSTEM_PROMPT = (
-    "You are operating a local recursive language memory runtime for an active agent. "
-    "The run history is available as the Python object `context`; it is not pasted into "
-    "the prompt. Use ```repl``` blocks to inspect `context` before answering. "
+    "You are operating a local offline consolidator runtime for an active agent. "
+    "The offline bundle is available as the Python object `bundle`; it is not pasted into "
+    "the prompt. Use ```repl``` blocks to inspect `bundle` before answering. "
     "Inside the REPL, use zero-based indices and these helpers: "
-    "`context.latest_messages(n)`, `context.message_slice(start, end)`, "
-    "`context.latest_traces(n)`, `context.trace(i)`, `context.grep(pattern, target=\"all\")`, "
-    "`context.peek(obj, limit=None)`, `context.to_text(obj, limit=None)`, "
-    "`llm_query(prompt)`, `rlm_query(query, target=None)`, `SHOW_VARS()`, "
+    "`bundle.latest_messages(n)`, `bundle.message_slice(start, end)`, "
+    "`bundle.latest_traces(n)`, `bundle.trace(i)`, `bundle.grep(pattern, target=\"all\")`, "
+    "`bundle.peek(obj, limit=None)`, `bundle.to_text(obj, limit=None)`, "
+    "`llm_query(prompt)`, `bundle_query(query, target=None)`, `SHOW_VARS()`, "
     "`FINAL(...)`, `FINAL_VAR(variable_name)`, and `print()`. "
-    "Use `print(context.peek(...))` when you need to inspect an object in detail. "
+    "Use `print(bundle.peek(...))` when you need to inspect an object in detail. "
     "When you are done, return either `FINAL(\"...\")` or `FINAL_VAR(variable_name)`."
 )
 _SUBCALL_SYSTEM_PROMPT = (
-    "You are answering a focused RLM subquery over the Python object `context`. "
-    "Use the same REPL tools to inspect the selected subcontext and return only the "
+    "You are answering a focused offline bundle subquery over the Python object `bundle`. "
+    "Use the same REPL tools to inspect the selected sub-bundle and return only the "
     "relevant answer."
 )
 
@@ -71,14 +72,14 @@ def resolve_model_name(*, backend: str, model: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class RLMMessageView:
+class BundleMessageView:
     index: int
     role: str
     content: str
 
 
 @dataclass(frozen=True, slots=True)
-class RLMSpanView:
+class BundleSpanView:
     trace_index: int
     index: int
     kind: str
@@ -96,7 +97,7 @@ class RLMSpanView:
         trace_index: int,
         index: int,
         record: TokentrimSpanRecord,
-    ) -> RLMSpanView:
+    ) -> BundleSpanView:
         return cls(
             trace_index=trace_index,
             index=index,
@@ -111,7 +112,7 @@ class RLMSpanView:
 
 
 @dataclass(frozen=True, slots=True)
-class RLMTraceView:
+class BundleTraceView:
     index: int
     trace_id: str
     source: str
@@ -119,12 +120,12 @@ class RLMTraceView:
     started_at: str | None
     ended_at: str | None
     metadata: dict[str, Any] | None
-    spans: tuple[RLMSpanView, ...]
+    spans: tuple[BundleSpanView, ...]
 
     @classmethod
-    def from_record(cls, *, index: int, record: TokentrimTraceRecord) -> RLMTraceView:
+    def from_record(cls, *, index: int, record: TokentrimTraceRecord) -> BundleTraceView:
         spans = tuple(
-            RLMSpanView.from_record(trace_index=index, index=span_index, record=span)
+            BundleSpanView.from_record(trace_index=index, index=span_index, record=span)
             for span_index, span in enumerate(record.spans)
         )
         return cls(
@@ -140,7 +141,7 @@ class RLMTraceView:
 
 
 @dataclass(frozen=True, slots=True)
-class RLMSearchMatch:
+class BundleSearchMatch:
     source: str
     target: str
     pattern: str
@@ -148,9 +149,9 @@ class RLMSearchMatch:
 
 
 @dataclass(frozen=True, slots=True)
-class RLMContextView:
-    messages: tuple[RLMMessageView, ...] = ()
-    traces: tuple[RLMTraceView, ...] = ()
+class OfflineBundleView:
+    messages: tuple[BundleMessageView, ...] = ()
+    traces: tuple[BundleTraceView, ...] = ()
     label: str = "run_history"
     operation_recorder: OperationRecorder | None = field(
         default=None,
@@ -165,9 +166,9 @@ class RLMContextView:
         messages: Sequence[Message],
         traces: Sequence[TokentrimTraceRecord],
         label: str = "run_history",
-    ) -> RLMContextView:
+    ) -> OfflineBundleView:
         message_views = tuple(
-            RLMMessageView(
+            BundleMessageView(
                 index=index,
                 role=str(message["role"]),
                 content=str(message["content"]),
@@ -175,26 +176,26 @@ class RLMContextView:
             for index, message in enumerate(messages)
         )
         trace_views = tuple(
-            RLMTraceView.from_record(index=index, record=trace)
+            BundleTraceView.from_record(index=index, record=trace)
             for index, trace in enumerate(traces)
         )
         return cls(messages=message_views, traces=trace_views, label=label)
 
     @classmethod
-    def from_text(cls, text: str, *, label: str = "text_context") -> RLMContextView:
+    def from_text(cls, text: str, *, label: str = "text_bundle") -> OfflineBundleView:
         stripped = text.strip()
         if not stripped:
             return cls(label=label)
         return cls(
-            messages=(RLMMessageView(index=0, role="user", content=stripped),),
+            messages=(BundleMessageView(index=0, role="user", content=stripped),),
             traces=(),
             label=label,
         )
 
-    def with_operation_recorder(self, recorder: OperationRecorder | None) -> RLMContextView:
+    def with_operation_recorder(self, recorder: OperationRecorder | None) -> OfflineBundleView:
         return replace(self, operation_recorder=recorder)
 
-    def latest_messages(self, n: int) -> tuple[RLMMessageView, ...]:
+    def latest_messages(self, n: int) -> tuple[BundleMessageView, ...]:
         count = max(0, int(n))
         result = self.messages[-count:] if count else ()
         self._record_browser_call(
@@ -204,7 +205,7 @@ class RLMContextView:
         )
         return result
 
-    def message_slice(self, start: int | None, end: int | None) -> tuple[RLMMessageView, ...]:
+    def message_slice(self, start: int | None, end: int | None) -> tuple[BundleMessageView, ...]:
         result = self.messages[slice(start, end)]
         self._record_browser_call(
             name="message_slice",
@@ -213,7 +214,7 @@ class RLMContextView:
         )
         return result
 
-    def latest_traces(self, n: int) -> tuple[RLMTraceView, ...]:
+    def latest_traces(self, n: int) -> tuple[BundleTraceView, ...]:
         count = max(0, int(n))
         result = self.traces[-count:] if count else ()
         self._record_browser_call(
@@ -223,7 +224,7 @@ class RLMContextView:
         )
         return result
 
-    def trace(self, index: int) -> RLMTraceView:
+    def trace(self, index: int) -> BundleTraceView:
         result = self.traces[index]
         self._record_browser_call(
             name="trace",
@@ -232,13 +233,13 @@ class RLMContextView:
         )
         return result
 
-    def grep(self, pattern: str, target: str = "all") -> tuple[RLMSearchMatch, ...]:
+    def grep(self, pattern: str, target: str = "all") -> tuple[BundleSearchMatch, ...]:
         compiled = _compile_pattern(pattern)
         normalized_target = target.strip().lower()
         if normalized_target not in {"all", "messages", "traces"}:
             normalized_target = "all"
 
-        matches: list[RLMSearchMatch] = []
+        matches: list[BundleSearchMatch] = []
         if normalized_target in {"all", "messages"}:
             for message in self.messages:
                 _append_matches(
@@ -306,10 +307,10 @@ class RLMContextView:
         )
         return text
 
-    def as_subcontext(self, target: Any | None = None) -> RLMContextView:
+    def as_subcontext(self, target: Any | None = None) -> OfflineBundleView:
         if target is None:
             return self.with_operation_recorder(None)
-        return _coerce_subcontext(target)
+        return _coerce_subbundle(target)
 
     def _record_browser_call(
         self,
@@ -331,7 +332,7 @@ class RLMContextView:
 
 
 @dataclass(slots=True)
-class LocalRLMRuntime:
+class LocalConsolidatorRuntime:
     model: str
     backend: str
     max_iterations: int
@@ -339,6 +340,8 @@ class LocalRLMRuntime:
     max_depth: int = 1
     max_subcalls: int = 4
     subcall_model: str | None = None
+    context_variable_name: str = "bundle"
+    context_aliases: tuple[str, ...] = ("context",)
     current_depth: int = field(default=0, repr=False)
     resolved_model: str = field(init=False)
     resolved_subcall_model: str = field(init=False)
@@ -346,7 +349,7 @@ class LocalRLMRuntime:
     _globals: dict[str, Any] = field(init=False)
     _locals: dict[str, Any] = field(init=False)
     _last_final_answer: str | None = field(init=False, default=None)
-    _context_value: RLMContextView = field(init=False)
+    _bundle_value: OfflineBundleView = field(init=False)
     _system_prompt_value: str = field(init=False, default=_SYSTEM_PROMPT)
     _current_operations: list[dict[str, Any]] = field(init=False, default_factory=list)
     _subcall_count: int = field(init=False, default=0)
@@ -366,7 +369,7 @@ class LocalRLMRuntime:
             "__builtins__": _SAFE_BUILTINS.copy(),
             "__name__": "__main__",
             "llm_query": self._llm_query,
-            "rlm_query": self._rlm_query,
+            "bundle_query": self._bundle_query,
             "FINAL": self._final,
             "FINAL_VAR": self._final_var,
             "SHOW_VARS": self._show_vars,
@@ -375,11 +378,11 @@ class LocalRLMRuntime:
         }
         self._locals = {}
         self._last_final_answer = None
-        self._context_value = RLMContextView()
+        self._bundle_value = OfflineBundleView()
 
     def run(
         self,
-        context_prompt: Any,
+        bundle_input: Any,
         root_prompt: str | None = None,
         *,
         system_prompt: str | None = None,
@@ -390,15 +393,23 @@ class LocalRLMRuntime:
             "subcalls_used": 0,
         }
         self._system_prompt_value = system_prompt or _SYSTEM_PROMPT
-        self._context_value = _coerce_context_prompt(context_prompt).with_operation_recorder(
+        self._bundle_value = _coerce_bundle_input(bundle_input).with_operation_recorder(
             self._record_operation
         )
-        self._locals = {"context": self._context_value}
+        self._locals = {}
+        self._bind_bundle_variables()
         self._last_final_answer = None
         self._subcall_count = 0
         message_history: list[dict[str, str]] = [
             {"role": "system", "content": self._system_prompt_value},
-            {"role": "user", "content": _build_user_prompt(root_prompt=root_prompt, iteration=0)},
+            {
+                "role": "user",
+                "content": _build_user_prompt(
+                    root_prompt=root_prompt,
+                    iteration=0,
+                    bundle_variable_name=self.context_variable_name,
+                ),
+            },
         ]
 
         for iteration in range(self.max_iterations):
@@ -437,13 +448,14 @@ class LocalRLMRuntime:
                     "content": _build_user_prompt(
                         root_prompt=root_prompt,
                         iteration=iteration + 1,
+                        bundle_variable_name=self.context_variable_name,
                     ),
                 }
             )
 
         self.trajectory["subcalls_used"] = self._subcall_count
-        raise RLMExecutionError(
-            "RLM runtime hit max iterations without producing a final answer."
+        raise ConsolidatorRuntimeError(
+            "consolidator runtime hit max iterations without producing a final answer."
         )
 
     def _model_completion(self, messages: list[dict[str, str]]) -> str:
@@ -471,9 +483,9 @@ class LocalRLMRuntime:
         )
         return response
 
-    def _rlm_query(self, query: str, target: Any | None = None) -> str:
+    def _bundle_query(self, query: str, target: Any | None = None) -> str:
         if self.current_depth >= self.max_depth:
-            error = "Error: rlm_query depth limit reached."
+            error = "Error: bundle_query depth limit reached."
             self._record_operation(
                 {
                     "type": "subcall",
@@ -485,7 +497,7 @@ class LocalRLMRuntime:
             )
             return error
         if self._subcall_count >= self.max_subcalls:
-            error = "Error: rlm_query subcall limit reached."
+            error = "Error: bundle_query subcall limit reached."
             self._record_operation(
                 {
                     "type": "subcall",
@@ -498,8 +510,8 @@ class LocalRLMRuntime:
             return error
 
         self._subcall_count += 1
-        subcontext = self._context_value.as_subcontext(target)
-        child_runtime = LocalRLMRuntime(
+        subbundle = self._bundle_value.as_subcontext(target)
+        child_runtime = LocalConsolidatorRuntime(
             model=self.subcall_model or self.model,
             backend=self.backend,
             max_iterations=self.max_iterations,
@@ -507,11 +519,13 @@ class LocalRLMRuntime:
             max_depth=self.max_depth,
             max_subcalls=self.max_subcalls,
             subcall_model=self.subcall_model,
+            context_variable_name=self.context_variable_name,
+            context_aliases=self.context_aliases,
             current_depth=self.current_depth + 1,
         )
         try:
             result = child_runtime.run(
-                subcontext,
+                subbundle,
                 root_prompt=f"Subquery:\n{str(query).strip()}",
                 system_prompt=_SUBCALL_SYSTEM_PROMPT,
             )
@@ -524,7 +538,7 @@ class LocalRLMRuntime:
             {
                 "type": "subcall",
                 "query": _clip_text(str(query), 400),
-                "target": _summarize_object(subcontext),
+                "target": _summarize_object(subbundle),
                 "status": status,
                 "result": _clip_text(result, 400),
                 "trajectory": child_runtime.trajectory,
@@ -533,10 +547,10 @@ class LocalRLMRuntime:
         return result
 
     def _peek(self, obj: Any, limit: int | None = None) -> str:
-        return self._context_value.peek(obj, limit=limit)
+        return self._bundle_value.peek(obj, limit=limit)
 
     def _to_text(self, obj: Any, limit: int | None = None) -> str:
-        return self._context_value.to_text(obj, limit=limit)
+        return self._bundle_value.to_text(obj, limit=limit)
 
     def _final(self, value: Any) -> str:
         answer = str(value)
@@ -556,7 +570,9 @@ class LocalRLMRuntime:
             return answer
 
         available = sorted(
-            name for name in self._locals if not name.startswith("_") and name != "context"
+            name
+            for name in self._locals
+            if not name.startswith("_") and name not in self._hidden_local_names()
         )
         if available:
             return (
@@ -572,7 +588,9 @@ class LocalRLMRuntime:
 
     def _show_vars(self) -> str:
         available = sorted(
-            name for name in self._locals if not name.startswith("_") and name != "context"
+            name
+            for name in self._locals
+            if not name.startswith("_") and name not in self._hidden_local_names()
         )
         if not available:
             return "No variables created yet."
@@ -590,7 +608,7 @@ class LocalRLMRuntime:
             combined = {**self._globals, **self._locals}
             exec(code, combined, combined)
             for key, value in combined.items():
-                if key in _RESERVED_NAMES or key.startswith("_"):
+                if key in _RESERVED_NAMES or key in self._hidden_local_names() or key.startswith("_"):
                     continue
                 self._locals[key] = value
         except Exception:
@@ -606,20 +624,22 @@ class LocalRLMRuntime:
             "stderr": stderr_buffer.getvalue(),
             "final_answer": self._last_final_answer,
             "locals": sorted(
-                name for name in self._locals if not name.startswith("_") and name != "context"
+                name
+                for name in self._locals
+                if not name.startswith("_") and name not in self._hidden_local_names()
             ),
             "operations": list(self._current_operations),
         }
 
     def _restore_helpers(self) -> None:
         self._globals["llm_query"] = self._llm_query
-        self._globals["rlm_query"] = self._rlm_query
+        self._globals["bundle_query"] = self._bundle_query
         self._globals["FINAL"] = self._final
         self._globals["FINAL_VAR"] = self._final_var
         self._globals["SHOW_VARS"] = self._show_vars
         self._globals["peek"] = self._peek
         self._globals["to_text"] = self._to_text
-        self._locals["context"] = self._context_value
+        self._bind_bundle_variables()
 
     def _consume_final_answer(self) -> str | None:
         if self._last_final_answer is None:
@@ -638,71 +658,85 @@ class LocalRLMRuntime:
 
         final_match = re.search(r"^\s*FINAL\((.*)\)\s*$", text, re.MULTILINE | re.DOTALL)
         if final_match is None:
-            return None
+            direct_json = _extract_json_object(text)
+            return direct_json
         return _unwrap_final_output(final_match.group(1).strip())
 
     def _record_operation(self, entry: dict[str, Any]) -> None:
         self._current_operations.append(entry)
 
+    def _bind_bundle_variables(self) -> None:
+        for name in (self.context_variable_name, *self.context_aliases):
+            self._locals[name] = self._bundle_value
 
-def _coerce_context_prompt(context_prompt: Any) -> RLMContextView:
-    if isinstance(context_prompt, RLMContextView):
-        return context_prompt
-    if isinstance(context_prompt, str):
-        return RLMContextView.from_text(context_prompt)
-    if isinstance(context_prompt, Sequence) and not isinstance(
-        context_prompt, (bytes, bytearray, str)
+    def _hidden_local_names(self) -> set[str]:
+        return {self.context_variable_name, *self.context_aliases}
+
+
+def _coerce_bundle_input(bundle_input: Any) -> OfflineBundleView:
+    if isinstance(bundle_input, OfflineBundleView):
+        return bundle_input
+    if isinstance(bundle_input, str):
+        return OfflineBundleView.from_text(bundle_input)
+    if isinstance(bundle_input, Sequence) and not isinstance(
+        bundle_input, (bytes, bytearray, str)
     ):
-        if all(_looks_like_message(item) for item in context_prompt):
-            return RLMContextView.from_history(messages=context_prompt, traces=())
-    return RLMContextView.from_text(_fallback_to_text(context_prompt))
+        if all(_looks_like_message(item) for item in bundle_input):
+            return OfflineBundleView.from_history(messages=bundle_input, traces=())
+    return OfflineBundleView.from_text(_fallback_to_text(bundle_input))
 
 
-def _coerce_subcontext(target: Any) -> RLMContextView:
-    if isinstance(target, RLMContextView):
+def _coerce_subbundle(target: Any) -> OfflineBundleView:
+    if isinstance(target, OfflineBundleView):
         return target.with_operation_recorder(None)
-    if isinstance(target, RLMMessageView):
-        return RLMContextView(messages=(target,), label=f"message[{target.index}]")
-    if isinstance(target, RLMTraceView):
-        return RLMContextView(traces=(target,), label=f"trace[{target.index}]")
-    if isinstance(target, RLMSpanView):
-        return RLMContextView.from_text(_span_text(target), label=f"trace[{target.trace_index}].span[{target.index}]")
-    if isinstance(target, RLMSearchMatch):
-        return RLMContextView.from_text(_search_match_text(target), label=target.source)
+    if isinstance(target, BundleMessageView):
+        return OfflineBundleView(messages=(target,), label=f"message[{target.index}]")
+    if isinstance(target, BundleTraceView):
+        return OfflineBundleView(traces=(target,), label=f"trace[{target.index}]")
+    if isinstance(target, BundleSpanView):
+        return OfflineBundleView.from_text(_span_text(target), label=f"trace[{target.trace_index}].span[{target.index}]")
+    if isinstance(target, BundleSearchMatch):
+        return OfflineBundleView.from_text(_search_match_text(target), label=target.source)
     if isinstance(target, str):
-        return RLMContextView.from_text(target)
+        return OfflineBundleView.from_text(target)
     if isinstance(target, Sequence) and not isinstance(target, (bytes, bytearray, str)):
         items = list(target)
         if not items:
-            return RLMContextView(label="empty_selection")
-        if all(isinstance(item, RLMMessageView) for item in items):
-            return RLMContextView(messages=tuple(items), label="message_selection")
-        if all(isinstance(item, RLMTraceView) for item in items):
-            return RLMContextView(traces=tuple(items), label="trace_selection")
+            return OfflineBundleView(label="empty_selection")
+        if all(isinstance(item, BundleMessageView) for item in items):
+            return OfflineBundleView(messages=tuple(items), label="message_selection")
+        if all(isinstance(item, BundleTraceView) for item in items):
+            return OfflineBundleView(traces=tuple(items), label="trace_selection")
         synthetic_messages = tuple(
-            RLMMessageView(
+            BundleMessageView(
                 index=index,
                 role="user",
                 content=_object_to_text(item, limit=_TEXT_CHAR_LIMIT),
             )
             for index, item in enumerate(items)
         )
-        return RLMContextView(messages=synthetic_messages, label="selection")
-    return RLMContextView.from_text(_fallback_to_text(target), label=type(target).__name__)
+        return OfflineBundleView(messages=synthetic_messages, label="selection")
+    return OfflineBundleView.from_text(_fallback_to_text(target), label=type(target).__name__)
 
 
-def _build_user_prompt(*, root_prompt: str | None, iteration: int) -> str:
-    task_line = root_prompt if root_prompt is not None else "Retrieve the relevant answer from `context`."
+def _build_user_prompt(
+    *,
+    root_prompt: str | None,
+    iteration: int,
+    bundle_variable_name: str,
+) -> str:
+    task_line = root_prompt if root_prompt is not None else "Retrieve the relevant answer from `bundle`."
     if iteration == 0:
         return (
             f"{task_line}\n\n"
-            "The run history is loaded in the REPL variable `context` as a structured object. "
+            f"The offline bundle is loaded in the REPL variable `{bundle_variable_name}` as a structured object. "
             "Inspect it with a `repl` block before answering."
         )
     return (
         f"{task_line}\n\n"
-        "Continue inspecting `context` if needed. Use another `repl` block, or return "
-        "FINAL(...)/FINAL_VAR(...) when you have the answer."
+        f"Continue inspecting `{bundle_variable_name}` if needed. Use another `repl` block, or return "
+        "the final JSON object directly, or use FINAL(...)/FINAL_VAR(...), when you have the answer. "
+        "Prefer finishing now over unnecessary extra browsing."
     )
 
 
@@ -743,7 +777,7 @@ def _format_operation(operation: dict[str, Any]) -> str:
         )
     if op_type == "subcall":
         return (
-            f"- rlm_query[{operation['status']}] query={operation['query']!r} "
+            f"- bundle_query[{operation['status']}] query={operation['query']!r} "
             f"target={operation['target']} result={operation['result']!r}"
         )
     if op_type == "llm_query":
@@ -773,6 +807,23 @@ def _unwrap_final_output(text: str) -> str:
     return text
 
 
+def _extract_json_object(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced is not None else stripped
+    if not candidate.startswith("{") or not candidate.endswith("}"):
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return candidate
+
+
 def _looks_like_message(item: Any) -> bool:
     return isinstance(item, dict) and "role" in item and "content" in item
 
@@ -786,7 +837,7 @@ def _compile_pattern(pattern: str) -> re.Pattern[str]:
 
 def _append_matches(
     *,
-    matches: list[RLMSearchMatch],
+    matches: list[BundleSearchMatch],
     pattern: str,
     compiled: re.Pattern[str],
     target: str,
@@ -797,7 +848,7 @@ def _append_matches(
     if match is None:
         return
     matches.append(
-        RLMSearchMatch(
+        BundleSearchMatch(
             source=source,
             target=target,
             pattern=pattern,
@@ -823,15 +874,15 @@ def _object_to_text(obj: Any, *, limit: int) -> str:
 
 
 def _render_object(obj: Any) -> str:
-    if isinstance(obj, RLMContextView):
-        return _context_text(obj)
-    if isinstance(obj, RLMMessageView):
+    if isinstance(obj, OfflineBundleView):
+        return _bundle_text(obj)
+    if isinstance(obj, BundleMessageView):
         return _message_text(obj)
-    if isinstance(obj, RLMTraceView):
+    if isinstance(obj, BundleTraceView):
         return _trace_text(obj)
-    if isinstance(obj, RLMSpanView):
+    if isinstance(obj, BundleSpanView):
         return _span_text(obj)
-    if isinstance(obj, RLMSearchMatch):
+    if isinstance(obj, BundleSearchMatch):
         return _search_match_text(obj)
     if isinstance(obj, Sequence) and not isinstance(obj, (bytes, bytearray, str)):
         if not obj:
@@ -840,26 +891,26 @@ def _render_object(obj: Any) -> str:
     return _fallback_to_text(obj)
 
 
-def _context_text(context: RLMContextView) -> str:
+def _bundle_text(bundle: OfflineBundleView) -> str:
     lines = [
-        f"context: {context.label}",
-        f"message_count: {len(context.messages)}",
-        f"trace_count: {len(context.traces)}",
+        f"bundle: {bundle.label}",
+        f"message_count: {len(bundle.messages)}",
+        f"trace_count: {len(bundle.traces)}",
     ]
-    if context.messages:
+    if bundle.messages:
         lines.append("live_messages:")
-        lines.extend(_indent_lines(_message_text(message) for message in context.messages))
-    if context.traces:
+        lines.extend(_indent_lines(_message_text(message) for message in bundle.messages))
+    if bundle.traces:
         lines.append("stored_traces:")
-        lines.extend(_indent_lines(_trace_text(trace) for trace in context.traces))
+        lines.extend(_indent_lines(_trace_text(trace) for trace in bundle.traces))
     return "\n".join(lines)
 
 
-def _message_text(message: RLMMessageView) -> str:
+def _message_text(message: BundleMessageView) -> str:
     return f"message[{message.index}] {message.role}: {message.content}"
 
 
-def _trace_summary_text(trace: RLMTraceView) -> str:
+def _trace_summary_text(trace: BundleTraceView) -> str:
     parts = [
         f"workflow={trace.workflow_name}",
         f"source={trace.source}",
@@ -869,7 +920,7 @@ def _trace_summary_text(trace: RLMTraceView) -> str:
     return " ".join(parts)
 
 
-def _trace_text(trace: RLMTraceView) -> str:
+def _trace_text(trace: BundleTraceView) -> str:
     lines = [
         f"trace[{trace.index}]",
         f"trace_id: {trace.trace_id}",
@@ -889,7 +940,7 @@ def _trace_text(trace: RLMTraceView) -> str:
     return "\n".join(lines)
 
 
-def _span_text(span: RLMSpanView) -> str:
+def _span_text(span: BundleSpanView) -> str:
     lines = [
         f"span[{span.index}]",
         f"kind: {span.kind}",
@@ -909,7 +960,7 @@ def _span_text(span: RLMSpanView) -> str:
     return "\n".join(lines)
 
 
-def _search_match_text(match: RLMSearchMatch) -> str:
+def _search_match_text(match: BundleSearchMatch) -> str:
     return (
         f"search_match source={match.source} target={match.target} "
         f"pattern={match.pattern!r}\n{match.excerpt}"
@@ -928,33 +979,33 @@ def _fallback_to_text(value: Any) -> str:
 def _summarize_object(obj: Any) -> Any:
     if obj is None:
         return None
-    if isinstance(obj, RLMContextView):
+    if isinstance(obj, OfflineBundleView):
         return {
-            "type": "context",
+            "type": "bundle",
             "label": obj.label,
             "message_count": len(obj.messages),
             "trace_count": len(obj.traces),
         }
-    if isinstance(obj, RLMMessageView):
+    if isinstance(obj, BundleMessageView):
         return {
             "type": "message",
             "label": f"message[{obj.index}]",
             "role": obj.role,
         }
-    if isinstance(obj, RLMTraceView):
+    if isinstance(obj, BundleTraceView):
         return {
             "type": "trace",
             "label": f"trace[{obj.index}]",
             "workflow": obj.workflow_name,
             "span_count": len(obj.spans),
         }
-    if isinstance(obj, RLMSpanView):
+    if isinstance(obj, BundleSpanView):
         return {
             "type": "span",
             "label": f"trace[{obj.trace_index}].span[{obj.index}]",
             "kind": obj.kind,
         }
-    if isinstance(obj, RLMSearchMatch):
+    if isinstance(obj, BundleSearchMatch):
         return {
             "type": "search_match",
             "source": obj.source,

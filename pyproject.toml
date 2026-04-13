@@ -18,6 +18,9 @@ dependencies = [
     "tiktoken>=0.6",
 ]
 
+[project.scripts]
+tokentrim = "tokentrim.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "mypy",

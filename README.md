@@ -1,94 +1,234 @@
 # Tokentrim
 
-Tokentrim is a local Python SDK for managing LLM context before model
-execution. It runs entirely in-process. There is no Tokentrim service layer.
+Tokentrim is a local, in-process Python SDK for managing LLM context before
+model execution. It does not run a hosted service and it does not require a
+Tokentrim backend.
+
+The current architecture has four main surfaces:
+
+- runtime context management
+- local-first memory
+- persisted traces
+- offline consolidation
 
 ## What It Does
 
-Tokentrim exposes a single compose-first API:
+Tokentrim exposes one compose-first API:
 
 - `Tokentrim(...).compose(*steps).apply(...)`
 
-The v1 wedge is conversation compaction for long-running coding and agent
-workflows. The main promise is simple: preserve the details that matter while
-reducing context size before model execution.
+The same runtime can operate on:
 
-The same runtime supports both payload tracks:
+- `context`
+- `tools`
 
-- context messages
-- tool definitions
+The current wedge is long-running coding and agent workflows:
+
+- compact old conversation safely
+- inject useful memory into the next turn
+- let an agent write bounded session memory
+- persist traces for later offline consolidation
 
 ## Install
+
+Base install:
 
 ```bash
 pip install tokentrim
 ```
 
-If you plan to use the OpenAI Agents integration:
+OpenAI Agents integration:
 
 ```bash
 pip install "tokentrim[openai-agents]"
 ```
 
-If you plan to use the in-repo RLM retrieval runtime:
+Development:
 
 ```bash
-pip install tokentrim
-```
-
-`tokentrim[rlm]` is still accepted as a compatibility alias, but it is now a
-no-op extra because the barebones local RLM runtime ships in-repo.
-
-For development:
-
-```bash
-pip install -e ".[dev,openai-agents,rlm]"
+pip install -e ".[dev,openai-agents]"
 pre-commit install
 ```
 
+`tokentrim[rlm]` is still accepted as a compatibility alias, but it is now a
+no-op extra kept only for backward compatibility.
+
 ## Usage
 
-The most common transforms are re-exported from `tokentrim` directly.
+The most common types and transforms are re-exported from `tokentrim`.
 
 ### 5-Minute Start
 
-If you are trying Tokentrim for the first time:
-
-1. Start with `CompactConversation` only.
-
-### Hero Path: Context Compaction
-
 ```python
-from tokentrim import InMemoryTraceStore, Tokentrim
-from tokentrim.transforms import CompactConversation, FilterMessages, MicrocompactMessages, RetrieveMemory
+from tokentrim import Tokentrim
+from tokentrim.transforms import CompactConversation, MicrocompactMessages
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
-trace_store = InMemoryTraceStore()
 
 result = tt.compose(
     MicrocompactMessages(),
     CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(model="gpt-4o-mini"),
-).apply(
-    context=messages,
-    user_id="user-123",
-    session_id="session-456",
-    trace_store=trace_store,
-)
+).apply(context=messages)
+
 optimized_messages = result.context
 ```
 
 What happens here:
 
-- Tokentrim first microcompacts older tool/result-heavy traffic deterministically.
-- Tokentrim checks whether the current context is over budget.
-- If it is, it extracts working state, edits stale context, and compacts older
-  history.
-- If it is already under budget, compaction becomes a no-op.
-- The returned `result.context` is what you should send to the model.
+- Tokentrim microcompacts older tool-heavy traffic deterministically
+- Tokentrim compacts older history only when needed
+- the returned `result.context` is the payload to send to the model
 
-Compaction can also target OpenAI-compatible non-OpenAI endpoints through LiteLLM:
+### Memory Injection
+
+If you provide a `memory_store`, Tokentrim owns memory injection at runtime.
+The agent does not search memory directly. The system does that before the
+model turn and prepends one bounded memory block when relevant.
+
+```python
+from tokentrim import FilesystemMemoryStore, Tokentrim
+from tokentrim.transforms import CompactConversation
+
+
+tt = Tokentrim(tokenizer="gpt-4o-mini")
+memory_store = FilesystemMemoryStore(root_dir=".tokentrim/memory")
+
+result = tt.compose(
+    CompactConversation(model="gpt-4o-mini", keep_last=8),
+).apply(
+    context=messages,
+    user_id="user-123",
+    session_id="session-456",
+    org_id="org-1",
+    task_hint="debug a failed database connection",
+    memory_store=memory_store,
+)
+```
+
+By default:
+
+- memory injection is system-owned
+- injected memory is additive
+- memory injection is context-only
+- the agent itself does not rewrite durable memory
+
+### Agent-Aware Session Memory
+
+If you want the agent to be able to write memory, enable agent-aware mode.
+Tokentrim exposes a standard session-memory tool and a system prompt that tells
+the agent when to use it.
+
+```python
+from tokentrim import FilesystemMemoryStore, Tokentrim
+from tokentrim.transforms import CompactConversation
+
+
+tt = Tokentrim(tokenizer="gpt-4o-mini")
+memory_store = FilesystemMemoryStore(root_dir=".tokentrim/memory")
+
+result = tt.compose(
+    CompactConversation(model="gpt-4o-mini", keep_last=8),
+).apply(
+    context=messages,
+    user_id="user-123",
+    session_id="session-456",
+    org_id="org-1",
+    memory_store=memory_store,
+    agent_aware_memory=True,
+)
+```
+
+Important rule:
+
+- runtime agents write session memory only
+
+Durable `user` and `org` memory are rewritten later by the offline
+consolidator.
+
+### Mixed Context + Tools Pipeline
+
+```python
+from tokentrim import FilesystemMemoryStore, FilesystemTraceStore, Tokentrim
+from tokentrim.transforms import CompactConversation, MicrocompactMessages
+
+
+tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
+memory_store = FilesystemMemoryStore(root_dir=".tokentrim/memory")
+trace_store = FilesystemTraceStore(root_dir=".tokentrim/traces")
+
+result = tt.compose(
+    MicrocompactMessages(),
+    CompactConversation(model="gpt-4o-mini", keep_last=8),
+).apply(
+    context=messages,
+    tools=tools,
+    user_id="user-123",
+    session_id="session-456",
+    org_id="org-1",
+    task_hint="debug a failed database connection",
+    memory_store=memory_store,
+    trace_store=trace_store,
+    agent_aware_memory=True,
+)
+
+optimized_messages = result.context
+optimized_tools = result.tools
+```
+
+`context=[...]` and `tools=[...]` are the preferred explicit call shapes.
+`apply(payload)` still works for non-empty lists, but named arguments are
+clearer and safer.
+
+For real local usage, this should be the default mental model:
+
+- memory is persisted under `.tokentrim/memory`
+- traces are persisted under `.tokentrim/traces`
+- in-memory stores are mainly for tests and short-lived experiments
+
+If you want offline consolidation later, use `FilesystemTraceStore(...)` from
+the beginning. The consolidator depends on durable trace history.
+
+### Canonical Message Shape
+
+Tokentrim understands structured tool traffic in `context`. The preferred
+message model is:
+
+- user turn: `{"role": "user", "content": "..."}`
+- assistant turn: `{"role": "assistant", "content": "..."}`
+- assistant tool call: `{"role": "assistant", "content": "...", "tool_calls": [...]}`
+- tool result: `{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}`
+
+If an integration has real tool calls, preserve them in this shape instead of
+flattening them into fake user messages.
+
+### Budgeting
+
+`tokenizer` is the shared model used for token counting only. Model-backed
+transforms define their own model, for example:
+
+- `CompactConversation(model=...)`
+
+`CompactConversation` can run in two budget modes:
+
+- explicit: pass `token_budget=...`
+- automatic: omit `token_budget` and let Tokentrim derive a threshold from the
+  configured model/context window
+
+When compaction runs, Tokentrim emits a deterministic working-state block plus
+the compacted-history block before the live messages.
+
+For explicit control, `CompactConversation` also accepts:
+
+- `strategy="balanced" | "aggressive" | "minimal"`
+- `instructions=...`
+- `context_window=...`
+- `auto_budget=False`
+- `model_options={...}`
+
+`model_options` is passed through to LiteLLM-compatible providers.
+
+Example with a non-OpenAI endpoint:
 
 ```python
 import os
@@ -107,113 +247,179 @@ step = CompactConversation(
 )
 ```
 
-### Mixed Pipeline
+## Traces
 
-```python
-from tokentrim import InMemoryTraceStore, Tokentrim
-from tokentrim.transforms import (
-    CompactConversation,
-    CompressToolDescriptions,
-    CreateTools,
-    FilterMessages,
-    MicrocompactMessages,
-    RetrieveMemory,
-)
+Tokentrim supports persisted canonical trace history through:
 
+- `TraceStore`
+- `FilesystemTraceStore`
+- `InMemoryTraceStore`
+- `TokentrimTraceRecord`
+- `TokentrimSpanRecord`
 
-tt = Tokentrim(tokenizer="gpt-4o-mini", token_budget=8000)
-trace_store = InMemoryTraceStore()
+Stored traces are additive. They do not replace `result.trace`.
 
-result = tt.compose(
-    FilterMessages(),
-    MicrocompactMessages(),
-    CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(model="gpt-4o-mini"),
-    CompressToolDescriptions(max_description_chars=160),
-    CreateTools(model="gpt-4o-mini"),
-).apply(
-    context=messages,
-    tools=tools,
-    user_id="user-123",
-    session_id="session-456",
-    task_hint="debug a failed database connection",
-    trace_store=trace_store,
-)
+`result.trace` is the synchronous pipeline trace for one Tokentrim run.
+Persisted trace stores are the durable offline replay surface used by
+integrations and consolidation.
 
-optimized_messages = result.context
-optimized_tools = result.tools
+In practice there are two different trace lifetimes:
+
+- `result.trace`
+  - synchronous
+  - one pipeline invocation
+  - returned immediately to the caller
+- `TraceStore`
+  - durable
+  - survives process restarts
+  - used for replay, debugging, and consolidation
+
+For the current architecture, `FilesystemTraceStore(root_dir=".tokentrim/traces")`
+should be the normal default. `InMemoryTraceStore()` is mostly useful for:
+
+- unit tests
+- examples that intentionally avoid filesystem setup
+- one-process experiments where trace history does not need to survive
+
+If you plan to run `tokentrim consolidate`, prefer `FilesystemTraceStore(...)`
+immediately so traces already exist in the right offline shape.
+
+For the current OpenAI Agents integration, stored traces are scoped by
+`user_id + session_id` and include canonicalized span records for:
+
+- native OpenAI Agents spans
+- Tokentrim transform spans emitted while a wrapped run is active
+
+## Memory Model
+
+Tokentrim separates memory by scope:
+
+- `session`: ephemeral working memory for one session
+- `user`: durable memory shared across sessions for one user
+- `org`: durable memory shared across users
+
+For the first local iteration, filesystem-backed memory is intended to live
+under `.tokentrim/`, for example:
+
+```text
+.tokentrim/
+  memory/
+  traces/
 ```
 
-Use one `Tokentrim` client and one API pattern (`compose(...).apply(...)`) for
-both payload kinds.
+The storage format is intentionally abstracted behind store interfaces. The
+runtime should not care whether memory lives in markdown, JSON, or something
+else.
 
-`context=[...]` and `tools=[...]` are the preferred explicit call shapes.
-`apply(payload)` still works for non-empty lists, but the named arguments are
-clearer and safer.
-
-Tokentrim also understands structured tool traffic inside `context`. The
-preferred message model is:
-
-- user turn: `{"role": "user", "content": "..."}`
-- assistant turn: `{"role": "assistant", "content": "..."}`
-- assistant tool call: `{"role": "assistant", "content": "...", "tool_calls": [...]}`
-- tool result: `{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}`
-
-If an integration has real tool calls, preserve them in this shape instead of
-flattening tool output into fake user messages. That keeps compaction and future
-tool-output microcompaction structurally correct.
-
-`tokenizer` is the shared model used for token counting only. Model-backed
-transforms define their own model (for example
-`CompactConversation(model=...)`).
-
-`CompactConversation` can run in two budget modes:
-
-- explicit: pass `token_budget=...` to `Tokentrim(...)` or `.apply(...)`
-- automatic: omit `token_budget` and let compaction derive a threshold from the
-  configured model/context window
-
-When compaction runs, Tokentrim emits two system blocks before the live
-messages: a deterministic working-state block for the current goal, active
-files, latest command, active error, constraints, and next step; then the
-compacted history block for older context.
-
-The default compaction prompt asks the model for a structured engineering
-handoff with sections such as `Goal`, `Active State`, `Critical Artifacts`,
-`Open Risks`, `Next Step`, and `Older Context`. Tokentrim preserves that prompt
-shape by default, but the returned compacted history is ultimately the model's
-output after deterministic preprocessing, not a runtime-enforced schema.
-
-For simple usage, automatic mode is usually the right choice:
+Recommended local-first defaults:
 
 ```python
-from tokentrim import CompactConversation, Tokentrim
+from tokentrim import FilesystemMemoryStore, FilesystemTraceStore
+
+
+memory_store = FilesystemMemoryStore(root_dir=".tokentrim/memory")
+trace_store = FilesystemTraceStore(root_dir=".tokentrim/traces")
+```
+
+That layout matches the intended lifecycle:
+
+- runtime reads from `session`, `user`, and `org` memory
+- runtime writes `session` memory only
+- tracing persists what happened during execution
+- the offline consolidator later reads both stores and rewrites durable memory
+
+## Offline Consolidation
+
+The consolidator is a separate subsystem from runtime memory injection.
+
+Runtime path:
+
+- the system injects memory into context
+- the agent can optionally write session memory
+- traces are persisted durably
+
+Offline path:
+
+- the consolidator reads traces plus memory
+- it analyzes what happened in finished sessions
+- it rewrites durable `user` and `org` memory
+
+CLI entrypoint:
+
+```bash
+tokentrim consolidate \
+  --memory-dir .tokentrim/memory \
+  --trace-dir .tokentrim/traces \
+  --mode deterministic \
+  --dry-run
+```
+
+Supported modes:
+
+- `deterministic`
+- `model`
+- `agentic`
+
+Supported write scopes:
+
+- `--scope all`
+- `--scope user`
+- `--scope org`
+
+Targeting options:
+
+- `--user-id ...`
+- `--session-id ...`
+- `--org-id ...`
+
+## OpenAI Agents SDK
+
+```python
+from agents import Agent, Runner
+
+from tokentrim import (
+    FilesystemMemoryStore,
+    FilesystemTraceStore,
+    CompactConversation,
+    Tokentrim,
+)
 
 
 tt = Tokentrim(tokenizer="gpt-4o-mini")
+memory_store = FilesystemMemoryStore(root_dir=".tokentrim/memory")
+trace_store = FilesystemTraceStore(root_dir=".tokentrim/traces")
 
-result = tt.compose(
+run_config = tt.compose(
     CompactConversation(model="gpt-4o-mini", keep_last=8),
-).apply(context=messages)
+).to_openai_agents(
+    token_budget=8000,
+    user_id="user-123",
+    session_id="session-456",
+    org_id="org-1",
+    memory_store=memory_store,
+    trace_store=trace_store,
+    agent_aware_memory=True,
+)
+
+result = Runner.run_sync(
+    Agent(name="Assistant", instructions="Answer concisely."),
+    "Summarise the last discussion.",
+    run_config=run_config,
+)
 ```
 
-When automatic mode is active, the derived budget is used both for deciding
-when to compact and for the pipeline's final hard budget enforcement.
+This is the main first-class integration helper today. Other runtimes can use
+the same core pipeline through `compose(...).apply(...)`.
 
-If you need explicit control, `CompactConversation` also accepts:
+The current adapter trims plain-text message inputs. Rich Responses items such
+as tool calls, images, and search results are preserved unchanged.
 
-- `strategy="balanced" | "aggressive" | "minimal"`
-- `instructions=...`
-- `context_window=...`
-- `auto_budget=False`
+If `trace_store` is provided, both `user_id` and `session_id` are required.
 
-`CompactConversation` also accepts `model_options` for provider-specific
-LiteLLM arguments such as `api_base`, `api_key`, or similar completion
-settings.
+For a realistic local setup, pass both filesystem-backed stores:
 
-Use `instructions` when you want to override the default compaction prompt.
-Use `strategy` to choose how aggressively deterministic pruning and
-microcompaction should compress older context. The default is `balanced`.
+- `FilesystemMemoryStore(root_dir=".tokentrim/memory")`
+- `FilesystemTraceStore(root_dir=".tokentrim/traces")`
 
 ## Live Compaction Tests
 
@@ -222,18 +428,11 @@ Tokentrim includes an opt-in live stress test for `CompactConversation` at:
 - `tests/tokentrim/transforms/compaction/test_live_stress.py`
 
 This test calls a real model through LiteLLM, measures elapsed time and token
-compression, and writes readable artifacts under
-`tests/artifacts/test_live_compaction_stress_round_trip/`.
+compression, and writes readable artifacts under:
 
-The artifact directory contains:
+- `tests/artifacts/test_live_compaction_stress_round_trip/`
 
-- `before.txt`: the original conversation before compaction
-- `after.txt`: the final compacted conversation
-- `metrics.txt`: model, elapsed time, token counts, and compression rate
-
-### Setup
-
-Copy `.env.test.example` to `.env.test`:
+Setup:
 
 ```bash
 cp .env.test.example .env.test
@@ -259,164 +458,36 @@ TOKENTRIM_TEST_API_KEY=your_mercury_key
 TOKENTRIM_TEST_API_BASE=https://api.inceptionlabs.ai/v1
 ```
 
-### Run
-
-From the repo root:
+Run:
 
 ```bash
 PYTHONPATH=. pytest --no-cov tests/tokentrim/transforms/compaction/test_live_stress.py -q -s
 ```
 
-Use `-s` so pytest shows the final summary line with:
-
-- model
-- elapsed time
-- tokens before compaction
-- tokens after compaction
-- tokens saved
-- compression percentage
-- artifact directory path
-
-You can also run all non-live tests normally:
+Non-live suite:
 
 ```bash
 PYTHONPATH=. pytest -q -m "not live"
 ```
 
-### CI Behavior
-
-GitHub Actions does not run live tests. The workflow excludes the `live`
-pytest marker explicitly and also sets `TOKENTRIM_LIVE_COMPACTION=0`.
-
-## On-Disk Layout
-
-Compaction itself does not create files. If you only use
-`CompactConversation`, Tokentrim stays entirely in-memory.
-
-## Transform Contract
-
-All transforms operate on one shared `PipelineState`:
-
-```python
-PipelineState(
-    context=[...],
-    tools=[...],
-)
-```
-
-Each transform can read or modify either side and returns the next state.
-Tracing and budget enforcement stay in the pipeline runtime.
-
-## Result Shape
-
-Every run returns one `Result` object:
-
-- `result.trace`: run metadata and per-step trace entries
-- `result.context`: final context payload as a tuple
-- `result.tools`: final tools payload as a tuple
-
-Both fields are always present. Unused sides are empty tuples.
-
-`result.trace` is the synchronous pipeline trace for that one Tokentrim run.
-It is not the same as the persisted identity trace store used by integrations.
-
-## Stored Traces
-
-Tokentrim also supports persisted canonical trace history through:
-
-- `TraceStore`
-- `InMemoryTraceStore`
-- `TokentrimTraceRecord`
-- `TokentrimSpanRecord`
-
-This is currently used by the OpenAI Agents integration. Stored traces are
-scoped by `user_id + session_id` and include canonicalized span records for:
-
-- native OpenAI Agents spans
-- Tokentrim transform spans emitted while a wrapped OpenAI run is active
-
-Stored traces are additive. They do not replace `result.trace`.
-`RetrieveMemory(model=...)` reads this stored trace history and synthesizes an
-additive memory block for the next step when earlier run details are useful.
-
-## Recursive Memory
-
-`RetrieveMemory(model=...)` is a trace-backed multi-step retrieval step:
-
-- it requires `trace_store`, `user_id`, and `session_id`
-- it runs whenever the transform is enabled and trace scope is available
-- it reads stored traces for that user/session scope as persistent run history
-- it builds a structured `context` object from live messages plus stored traces
-- it uses Tokentrim's in-repo local RLM runtime to browse `context`, inspect slices, grep older history, and issue one depth-1 `rlm_query(...)` subcall over an arbitrary subcontext
-- it injects one retrieved system-memory block ahead of live messages when older history is helpful for the immediate next step
-
-Important behavior:
-
-- it is context-only and does not modify tools
-- it is a no-op when scope is missing, no traces exist, or the RLM returns empty output
-- it uses a local in-process REPL loop with `max_depth=1`; that means root retrieval plus one depth-1 recursive subcall, with no deeper recursion or alternate sandboxes
-- it rejects leaked RLM scaffold output such as `FINAL(...)` / `FINAL_VAR(...)` instead of injecting it into context
-- blank output means “no additional memory needed this turn”; it is logged as `no_memory`, not treated as an error
-- retrieved memory is trimmed to `max_memory_tokens`, and if a request budget is active it is also trimmed to remaining headroom or dropped entirely when no space remains
-
-This transform now behaves like an RLM-backed multi-step retriever. It uses
-stored trace history plus the current live context to decide what the
-agent is most likely doing next, browse the relevant history, and return only
-the additive memory that helps with that immediate next step.
-
 ## Package Map
 
-- `tokentrim/client.py`: `Tokentrim` facade + composed pipeline API
-- `tokentrim/pipeline/`: requests + unified pipeline runtime
+- `tokentrim/client.py`: public facade + composed-pipeline API
+- `tokentrim/pipeline/`: request models and unified execution runtime
+- `tokentrim/transforms/`: runtime transforms such as compaction and memory injection
+- `tokentrim/memory/`: memory records, stores, querying, formatting, and agent-aware writes
 - `tokentrim/tracing/`: canonical persisted trace records, stores, and pipeline tracer interfaces
-- `tokentrim/transforms/`: pipeline steps (`compaction`)
-- `tokentrim/core/`: shared helpers (`copy_utils`, `token_counting`, `llm_client`)
+- `tokentrim/consolidator/`: offline consolidation agents, planning/apply engine, and orchestration
+- `tokentrim/core/`: shared helpers such as copy/freeze, token counting, and LiteLLM integration
 - `tokentrim/types/`: payload/result/trace datatypes
-- `tokentrim/integrations/`: adapter boundary + OpenAI Agents integration
+- `tokentrim/integrations/`: adapter boundary + concrete integrations
 - `tokentrim/errors/`: shared SDK errors
-
-## OpenAI Agents SDK
-
-```python
-from agents import Agent, Runner
-
-from tokentrim import CompactConversation, Tokentrim
-
-
-tt = Tokentrim(tokenizer="gpt-4o-mini")
-
-run_config = tt.compose(
-    CompactConversation(model="gpt-4o-mini", keep_last=8),
-    RetrieveMemory(model="gpt-4o-mini"),
-).to_openai_agents(
-    token_budget=8000,
-)
-
-result = Runner.run_sync(
-    Agent(name="Assistant", instructions="Answer concisely."),
-    "Summarise the last discussion.",
-    run_config=run_config,
-)
-```
-
-This is the main first-class integration helper today. Other runtimes can use
-the same compaction step through the generic `compose(...).apply(...)` API.
-
-The current adapter trims plain-text message inputs. Rich Responses items such
-as tool calls, images, and search results are preserved unchanged.
-
-The current adapter is still message-oriented in practice. Tool transforms in a
-pipeline will run, but OpenAI Agents hook inputs only provide message history to
-Tokentrim.
-
-If `trace_store` is provided, both `user_id` and `session_id` are required.
-Stored traces include canonical OpenAI spans plus Tokentrim transform spans
-such as `compaction` when those transforms run inside an active OpenAI trace.
 
 ## Design Notes
 
 - results are frozen dataclasses
 - message and tool schemas stay intentionally minimal in v0.1
-- `RetrieveMemory` now uses Tokentrim's internal local-only RLM runtime for additive-memory synthesis
-- `RetrieveMemory` prepends one bounded retrieved-memory system block instead of replacing live context
+- memory injection is system-owned and additive
+- agent-aware memory writes target session memory only
+- offline consolidation is separate from runtime memory injection
 - tool BPE is a deterministic heuristic in v0.1

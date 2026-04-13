@@ -147,6 +147,7 @@ def _request(*, token_budget: int | None) -> ContextRequest:
         messages=tuple(),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=token_budget,
         steps=(CompactConversation(),),
     )

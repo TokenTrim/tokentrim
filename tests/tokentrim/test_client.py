@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 import tokentrim as tokentrim_module
@@ -10,8 +11,10 @@ import tokentrim.tracing as tracing_module
 from tokentrim import Tokentrim
 from tokentrim.errors.base import TokentrimError
 from tokentrim.integrations.base import IntegrationAdapter
+from tokentrim.memory import FilesystemMemoryStore, InMemoryMemoryStore, MemoryWrite
 from tokentrim.pipeline.requests import PipelineRequest
 from tokentrim.tracing import (
+    FilesystemTraceStore,
     InMemoryTraceStore,
     PipelineSpan,
     PipelineTracer,
@@ -21,63 +24,8 @@ from tokentrim.types.result import Result
 from tokentrim.types.state import PipelineState
 from tokentrim.types.tool import Tool
 from tokentrim.types.trace import Trace
-from tokentrim.transforms import CompactConversation, RetrieveMemory
+from tokentrim.transforms import CompactConversation
 from tokentrim.transforms.base import Transform
-
-
-def _seed_trace_store() -> InMemoryTraceStore:
-    store = InMemoryTraceStore()
-    store.create_trace(
-        user_id="u1",
-        session_id="s1",
-        trace=TokentrimTraceRecord(
-            trace_id="openai_agents:trace_1",
-            source="openai_agents",
-            capture_mode="identity",
-            source_trace_id="trace_1",
-            user_id="u1",
-            session_id="s1",
-            workflow_name="workflow-1",
-            started_at=None,
-            ended_at=None,
-            group_id=None,
-            metadata={"topic": "support"},
-            raw_trace={"ignored": "raw"},
-        ),
-    )
-    store.complete_trace(trace_id="openai_agents:trace_1")
-    return store
-
-
-def _install_fake_rlm(monkeypatch: pytest.MonkeyPatch, *, response: str) -> None:
-    class FakeRuntime:
-        def __init__(
-            self,
-            *,
-            model,
-            backend,
-            max_iterations,
-            tokenizer_model,
-            max_depth,
-            max_subcalls,
-            subcall_model,
-        ):
-            del model
-            del backend
-            del max_iterations
-            del tokenizer_model
-            del max_depth
-            del max_subcalls
-            del subcall_model
-            self.trajectory = {"iterations": [{"response": response}]}
-
-        def run(self, prompt, root_prompt=None, system_prompt=None):
-            del prompt
-            del root_prompt
-            del system_prompt
-            return response
-
-    monkeypatch.setattr("tokentrim.transforms.rlm.transform.LocalRLMRuntime", FakeRuntime)
 
 
 class EchoAdapter(IntegrationAdapter[str]):
@@ -220,6 +168,191 @@ def test_compose_apply_propagates_trace_store(monkeypatch: pytest.MonkeyPatch) -
     assert captured["trace_store"] is trace_store
 
 
+def test_tokentrim_defaults_to_local_first_store_roots(tmp_path: Path) -> None:
+    client = Tokentrim(storage_root=tmp_path / ".tokentrim")
+
+    assert isinstance(client.default_memory_store, FilesystemMemoryStore)
+    assert isinstance(client.default_trace_store, FilesystemTraceStore)
+    assert client.memory_root == tmp_path / ".tokentrim" / "memory"
+    assert client.trace_root == tmp_path / ".tokentrim" / "traces"
+
+
+def test_compose_apply_uses_default_filesystem_stores_when_not_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = Tokentrim(storage_root=tmp_path / ".tokentrim")
+    captured = {}
+
+    def fake_run(request):
+        captured["memory_store"] = request.memory_store
+        captured["trace_store"] = request.trace_store
+        return Result(
+            context=tuple(),
+            trace=Trace(
+                id="trace",
+                token_budget=request.token_budget,
+                input_tokens=0,
+                output_tokens=0,
+                steps=tuple(),
+            ),
+        )
+
+    monkeypatch.setattr(client._pipeline, "run", fake_run)
+
+    client.compose(TestFilterTransform()).apply(context=[], user_id="u1", session_id="s1", org_id="o1")
+
+    assert captured["memory_store"] is client.default_memory_store
+    assert captured["trace_store"] is client.default_trace_store
+
+
+def test_compose_apply_does_not_force_default_stores_without_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = Tokentrim(storage_root=tmp_path / ".tokentrim")
+    captured = {}
+
+    def fake_run(request):
+        captured["memory_store"] = request.memory_store
+        captured["trace_store"] = request.trace_store
+        return Result(
+            context=tuple(),
+            trace=Trace(
+                id="trace",
+                token_budget=request.token_budget,
+                input_tokens=0,
+                output_tokens=0,
+                steps=tuple(),
+            ),
+        )
+
+    monkeypatch.setattr(client._pipeline, "run", fake_run)
+
+    client.compose(TestFilterTransform()).apply(context=[])
+
+    assert captured["memory_store"] is None
+    assert captured["trace_store"] is None
+
+
+def test_compose_apply_propagates_memory_store_and_org_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Tokentrim()
+    memory_store = InMemoryMemoryStore()
+    captured = {}
+
+    def fake_run(request):
+        captured["memory_store"] = request.memory_store
+        captured["org_id"] = request.org_id
+        return Result(
+            context=tuple(),
+            trace=Trace(
+                id="trace",
+                token_budget=request.token_budget,
+                input_tokens=0,
+                output_tokens=0,
+                steps=tuple(),
+            ),
+        )
+
+    monkeypatch.setattr(client._pipeline, "run", fake_run)
+
+    client.compose(TestFilterTransform()).apply(
+        context=[],
+        org_id="org_1",
+        memory_store=memory_store,
+    )
+
+    assert captured["memory_store"] is memory_store
+    assert captured["org_id"] == "org_1"
+
+
+def test_compose_apply_auto_injects_memory_when_store_is_present() -> None:
+    client = Tokentrim()
+    memory_store = InMemoryMemoryStore()
+    memory_store.write_session_memory(
+        session_id="sess_1",
+        write=MemoryWrite(
+            content="Use the repository root when debugging command failures",
+            kind="active_state",
+        ),
+    )
+
+    result = client.compose().apply(
+        context=[{"role": "user", "content": "debug the command failure"}],
+        user_id="user_1",
+        session_id="sess_1",
+        org_id="org_1",
+        memory_store=memory_store,
+        token_budget=500,
+    )
+
+    assert result.context[0]["role"] == "system"
+    assert "Injected memory:" in str(result.context[0]["content"])
+    assert "repository root" in str(result.context[0]["content"])
+
+
+def test_compose_apply_can_enable_agent_aware_memory_mode() -> None:
+    client = Tokentrim()
+    memory_store = InMemoryMemoryStore()
+
+    result = client.compose().apply(
+        context=[{"role": "user", "content": "debug the command failure"}],
+        user_id="user_1",
+        session_id="sess_1",
+        org_id="org_1",
+        memory_store=memory_store,
+        agent_aware_memory=True,
+        token_budget=500,
+    )
+
+    assert result.context[0]["role"] == "system"
+    assert "Session memory is available" in str(result.context[0]["content"])
+    assert any(tool["name"] == "remember" for tool in result.tools)
+
+
+def test_tokentrim_exposes_explicit_session_memory_write_helpers() -> None:
+    client = Tokentrim()
+    memory_store = InMemoryMemoryStore()
+
+    record = client.write_session_memory(
+        memory_store=memory_store,
+        session_id="sess_1",
+        content="Avoid destructive commands unless requested",
+        kind="constraint",
+        dedupe_key="avoid_destructive",
+    )
+    writer = client.session_memory_writer(memory_store=memory_store, session_id="sess_1")
+    updated = writer.write(
+        content="Avoid destructive commands without explicit approval",
+        kind="constraint",
+        dedupe_key="avoid_destructive",
+    )
+
+    assert record.memory_id == updated.memory_id
+    assert updated.content == "Avoid destructive commands without explicit approval"
+
+
+def test_tokentrim_session_memory_helpers_use_default_store_when_not_provided(tmp_path: Path) -> None:
+    client = Tokentrim(storage_root=tmp_path / ".tokentrim")
+
+    record = client.write_session_memory(
+        session_id="sess_1",
+        content="Avoid destructive commands unless requested",
+        kind="constraint",
+        dedupe_key="avoid_destructive",
+    )
+    updated = client.session_memory_writer(session_id="sess_1").write(
+        content="Avoid destructive commands without explicit approval",
+        kind="constraint",
+        dedupe_key="avoid_destructive",
+    )
+
+    assert record.memory_id == updated.memory_id
+    assert updated.content == "Avoid destructive commands without explicit approval"
+
+
 def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatch) -> None:
     client = Tokentrim()
     pipeline_tracer = RecordingPipelineTracer()
@@ -243,26 +376,6 @@ def test_compose_apply_propagates_pipeline_tracer(monkeypatch: pytest.MonkeyPatc
     client.compose(TestFilterTransform()).apply(context=[], pipeline_tracer=pipeline_tracer)
 
     assert captured["pipeline_tracer"] is pipeline_tracer
-
-
-def test_rlm_store_belongs_to_rlm_transform(monkeypatch: pytest.MonkeyPatch) -> None:
-    trace_store = _seed_trace_store()
-    client = Tokentrim()
-    messages = [{"role": "user", "content": "hello " * 40}]
-    _install_fake_rlm(monkeypatch, response="ctx")
-
-    result = client.compose(RetrieveMemory(model="memory-model")).apply(
-        messages,
-        user_id="u1",
-        session_id="s1",
-        token_budget=200,
-        trace_store=trace_store,
-    )
-
-    assert result.context == (
-        {"role": "system", "content": "Retrieved memory:\nctx"},
-        {"role": "user", "content": "hello " * 40},
-    )
 
 
 def test_constructor_does_not_define_per_transform_models() -> None:
@@ -403,7 +516,6 @@ def test_compose_apply_context_wires_compaction(
         "tokentrim.transforms.compaction.transform.generate_text",
         lambda **kwargs: "summary",
     )
-    _install_fake_rlm(monkeypatch, response="ctx")
     original_message_count = len(messages)
     monkeypatch.setattr(
         "tokentrim.transforms.compaction.transform.count_message_tokens",
@@ -413,25 +525,22 @@ def test_compose_apply_context_wires_compaction(
     )
     result = client.compose(
         CompactConversation(model="compact-model"),
-        RetrieveMemory(model="memory-model"),
     ).apply(
         messages,
         user_id="u1",
         session_id="s1",
         token_budget=40,
-        trace_store=_seed_trace_store(),
     )
 
     assert isinstance(result.context, tuple)
     assert isinstance(result.trace.steps, tuple)
     assert result.trace.id
     assert result.context[0] == {"role": "system", "content": "History only.\n\nsummary"}
-    assert result.context[1] == {"role": "system", "content": "Retrieved memory:\nctx"}
     assert result.context[-2:] == (
         {"role": "user", "content": "issue-five"},
         {"role": "assistant", "content": "6"},
     )
-    assert [trace.step_name for trace in result.trace.steps] == ["compaction", "rlm"]
+    assert [trace.step_name for trace in result.trace.steps] == ["inject_memory", "compaction"]
     assert all(message["content"].strip() for message in result.context)
     assert result.trace.output_tokens > 0
 

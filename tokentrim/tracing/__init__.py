@@ -8,7 +8,7 @@ from tokentrim.tracing.pipeline_tracer import (
     resolve_pipeline_tracer,
 )
 from tokentrim.tracing.records import TokentrimSpanRecord, TokentrimTraceRecord
-from tokentrim.tracing.store import InMemoryTraceStore, TraceStore
+from tokentrim.tracing.store import FilesystemTraceStore, InMemoryTraceStore, TraceStore
 
 __all__ = [
     "PipelineSpan",
@@ -17,6 +17,7 @@ __all__ = [
     "TOKENTRIM_TRANSFORM_SPAN_NAME_PREFIX",
     "TokentrimSpanRecord",
     "TokentrimTraceRecord",
+    "FilesystemTraceStore",
     "InMemoryTraceStore",
     "TraceStore",
     "build_transform_span_data",

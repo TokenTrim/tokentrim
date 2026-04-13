@@ -7,6 +7,7 @@ from tokentrim.types.message import Message
 from tokentrim.types.tool import Tool
 
 if TYPE_CHECKING:
+    from tokentrim.memory import MemoryStore
     from tokentrim.tracing import PipelineTracer, TraceStore
     from tokentrim.transforms.base import Transform
 
@@ -17,8 +18,11 @@ class PipelineRequest:
     tools: tuple[Tool, ...] = ()
     user_id: str | None = None
     session_id: str | None = None
+    org_id: str | None = None
     task_hint: str | None = None
     token_budget: int | None = None
+    memory_store: MemoryStore | None = None
+    agent_aware_memory: bool = False
     trace_store: TraceStore | None = None
     pipeline_tracer: PipelineTracer | None = None
     steps: tuple[Transform, ...] = ()
@@ -32,6 +36,7 @@ class ContextRequest(PipelineRequest):
         messages: tuple[Message, ...],
         user_id: str | None,
         session_id: str | None,
+        org_id: str | None,
         token_budget: int | None,
         steps: tuple[Transform, ...],
     ) -> None:
@@ -41,8 +46,11 @@ class ContextRequest(PipelineRequest):
             tools=(),
             user_id=user_id,
             session_id=session_id,
+            org_id=org_id,
             task_hint=None,
             token_budget=token_budget,
+            memory_store=None,
+            agent_aware_memory=False,
             trace_store=None,
             pipeline_tracer=None,
             steps=steps,
@@ -65,8 +73,11 @@ class ToolsRequest(PipelineRequest):
             tools=tools,
             user_id=None,
             session_id=None,
+            org_id=None,
             task_hint=task_hint,
             token_budget=token_budget,
+            memory_store=None,
+            agent_aware_memory=False,
             trace_store=None,
             pipeline_tracer=None,
             steps=steps,

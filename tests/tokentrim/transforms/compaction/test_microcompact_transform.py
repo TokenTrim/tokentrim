@@ -23,6 +23,7 @@ def _request() -> ContextRequest:
         messages=tuple(),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(MicrocompactMessages(),),
     )

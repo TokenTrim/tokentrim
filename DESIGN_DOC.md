@@ -42,6 +42,8 @@ Main public objects:
 
 Supporting public subsystems:
 
+- `tokentrim.memory`
+- `tokentrim.consolidator`
 - `tokentrim.tracing`
 
 Typical execution shape:
@@ -60,7 +62,7 @@ through one shared `PipelineState`.
 - compose-first: one primary way to use the system
 - explicit transforms: no hidden background optimizer
 - immutable results: the pipeline returns frozen outputs
-- subsystem boundaries: tracing stays separate from compaction
+- subsystem boundaries: memory, tracing, and consolidator stay separate from compaction
 
 ## Package Layout
 
@@ -69,14 +71,13 @@ through one shared `PipelineState`.
 | `tokentrim/client.py` | Public facade and composed-pipeline entrypoint |
 | `tokentrim/pipeline/` | Request models and unified execution runtime |
 | `tokentrim/transforms/base.py` | Shared transform contract |
-| `tokentrim/transforms/filter/` | Message filtering transform |
 | `tokentrim/transforms/compaction/` | Conversation compaction transform |
-| `tokentrim/transforms/rlm/` | Retrieval-memory transform + memory store interface |
-| `tokentrim/transforms/compress_tools/` | Deterministic tool description compression |
-| `tokentrim/transforms/create_tools/` | Model-backed missing tool creation |
+| `tokentrim/transforms/memory.py` | Runtime memory injection and agent-aware memory transforms |
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
 | `tokentrim/core/token_counting.py` | Token counting helpers |
 | `tokentrim/core/llm_client.py` | LiteLLM wrapper used by model-backed transforms |
+| `tokentrim/memory/` | Memory records, stores, formatting, querying, and session-memory write helpers |
+| `tokentrim/consolidator/` | Offline consolidation agents, planning/apply engine, and orchestration |
 | `tokentrim/tracing/` | Canonical persisted tracing models, store implementations, and pipeline tracing interfaces |
 | `tokentrim/types/` | Shared datatypes (`Message`, `Tool`, `PipelineState`, `Trace`, `StepTrace`, `Result`) |
 | `tokentrim/integrations/base.py` | Integration adapter contract |
@@ -121,7 +122,7 @@ This matters for context management:
 - compaction can distinguish conversational turns from tool traffic
 - tool-output-specific microcompaction can operate structurally instead of
   heuristically
-- trace-driven transforms such as retrieval can preserve more useful signal
+- trace-driven offline consolidation can preserve more useful signal
 
 Integrations should not encode tool output as `role="user"` unless the host SDK
 gives no way to preserve tool-call structure.
@@ -307,9 +308,11 @@ The current architecture does not treat Tokentrim as:
 Those may become adjacent concerns later, but they are not part of the current
 core design.
 
-For the current OpenAI Agents integration, `RetrieveMemory` runs unchanged on
-the core pipeline side. It only needs `trace_store`, `user_id`, and
-`session_id` so it can read persisted canonical traces for that session scope.
+For the current OpenAI Agents integration, memory injection still runs on the
+core pipeline side. If a `memory_store` is present, Tokentrim injects memory
+before the model turn. If `agent_aware_memory=True`, Tokentrim also exposes the
+session-memory write tool to the agent. Persisted traces remain separate and
+feed the offline consolidator later.
 
 ## Contributor Notes
 

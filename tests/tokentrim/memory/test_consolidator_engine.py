@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pytest
-from tokentrim.transforms.rlm.error import RLMExecutionError
-from tokentrim.transforms.rlm.runtime import (
-    LocalRLMRuntime,
-    RLMContextView,
+from tokentrim.consolidator.engine import (
+    LocalConsolidatorRuntime,
+    OfflineBundleView,
     resolve_model_name,
 )
+from tokentrim.consolidator.errors import ConsolidatorRuntimeError
 from tokentrim.tracing.records import TokentrimSpanRecord, TokentrimTraceRecord
 
 
@@ -44,15 +44,15 @@ def _trace(trace_id: str, *, workflow_name: str, topic: str) -> TokentrimTraceRe
     )
 
 
-def _context() -> RLMContextView:
-    return RLMContextView.from_history(
+def _bundle() -> OfflineBundleView:
+    return OfflineBundleView.from_history(
         messages=[
             {"role": "user", "content": "build caffe from source"},
             {"role": "assistant", "content": "checking dependency versions"},
             {"role": "user", "content": "$ make -j2\n[exit_code] 2\ncompiler missing header"},
         ],
         traces=[_trace("openai_agents:trace_1", workflow_name="workflow-1", topic="compiler")],
-        label="test_context",
+        label="test_bundle",
     )
 
 
@@ -65,36 +65,36 @@ def test_runtime_root_prompt_does_not_inline_serialized_history(
         calls.append(kwargs["messages"])
         return 'FINAL("relevant memory")'
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+    monkeypatch.setattr("tokentrim.consolidator.engine.generate_text", fake_generate_text)
 
-    result = LocalRLMRuntime(
+    result = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=1,
-    ).run(_context(), root_prompt="Retrieve the next-step context.")
+    ).run(_bundle(), root_prompt="Retrieve the next-step bundle.")
 
     assert result == "relevant memory"
     serialized_prompt = "\n".join(message["content"] for message in calls[0])
     assert "workflow-1" not in serialized_prompt
     assert "compiler dependency missing during build" not in serialized_prompt
     assert "build caffe from source" not in serialized_prompt
-    assert "`context.latest_messages(n)`" in serialized_prompt
+    assert "`bundle.latest_messages(n)`" in serialized_prompt
 
 
-def test_context_browser_methods_are_bounded_and_deterministic() -> None:
-    context = _context()
+def test_bundle_browser_methods_are_bounded_and_deterministic() -> None:
+    bundle = _bundle()
 
-    recent = context.latest_messages(2)
-    trace = context.trace(0)
-    matches = context.grep("compiler")
+    recent = bundle.latest_messages(2)
+    trace = bundle.trace(0)
+    matches = bundle.grep("compiler")
 
     assert [message.role for message in recent] == ["assistant", "user"]
-    assert context.message_slice(0, 1)[0].content == "build caffe from source"
-    assert context.latest_traces(1)[0].workflow_name == "workflow-1"
+    assert bundle.message_slice(0, 1)[0].content == "build caffe from source"
+    assert bundle.latest_traces(1)[0].workflow_name == "workflow-1"
     assert matches[0].source == "message[2]"
     assert any(match.source == "trace[0]" for match in matches)
-    assert "compiler" in context.peek(matches, limit=120).lower()
-    assert "workflow: workflow-1" in context.to_text(trace, limit=400)
+    assert "compiler" in bundle.peek(matches, limit=120).lower()
+    assert "workflow: workflow-1" in bundle.to_text(trace, limit=400)
 
 
 def test_runtime_records_browser_calls_and_persists_variables(
@@ -104,12 +104,12 @@ def test_runtime_records_browser_calls_and_persists_variables(
         [
             (
                 "```repl\n"
-                "recent = context.latest_messages(2)\n"
-                "one = context.message_slice(0, 1)\n"
-                "trace0 = context.trace(0)\n"
-                "matches = context.grep('compiler')\n"
-                "summary = context.to_text(trace0, limit=400)\n"
-                "print(context.peek(recent, limit=200))\n"
+                "recent = bundle.latest_messages(2)\n"
+                "one = bundle.message_slice(0, 1)\n"
+                "trace0 = bundle.trace(0)\n"
+                "matches = bundle.grep('compiler')\n"
+                "summary = bundle.to_text(trace0, limit=400)\n"
+                "print(bundle.peek(recent, limit=200))\n"
                 "```"
             ),
             "FINAL_VAR(summary)",
@@ -117,16 +117,16 @@ def test_runtime_records_browser_calls_and_persists_variables(
     )
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.runtime.generate_text",
+        "tokentrim.consolidator.engine.generate_text",
         lambda **kwargs: next(responses),
     )
 
-    runtime = LocalRLMRuntime(
+    runtime = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
     )
-    result = runtime.run(_context(), root_prompt="Find the relevant context.")
+    result = runtime.run(_bundle(), root_prompt="Find the relevant bundle.")
 
     assert "workflow: workflow-1" in result
     operations = runtime.trajectory["iterations"][0]["code_blocks"][0]["operations"]
@@ -134,7 +134,7 @@ def test_runtime_records_browser_calls_and_persists_variables(
     assert operation_names == ["latest_messages", "message_slice", "trace", "grep", "to_text", "peek"]
 
 
-def test_runtime_rlm_query_launches_isolated_subcall_and_records_trajectory(
+def test_runtime_bundle_query_launches_isolated_subcall_and_records_trajectory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -142,8 +142,8 @@ def test_runtime_rlm_query_launches_isolated_subcall_and_records_trajectory(
         [
             (
                 "```repl\n"
-                "matches = context.grep('compiler')\n"
-                "answer = rlm_query('What failed?', matches)\n"
+                "matches = bundle.grep('compiler')\n"
+                "answer = bundle_query('What failed?', matches)\n"
                 "print(answer)\n"
                 "```"
             ),
@@ -156,15 +156,15 @@ def test_runtime_rlm_query_launches_isolated_subcall_and_records_trajectory(
         calls.append(kwargs)
         return next(responses)
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+    monkeypatch.setattr("tokentrim.consolidator.engine.generate_text", fake_generate_text)
 
-    runtime = LocalRLMRuntime(
+    runtime = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
         subcall_model="gpt-4o-mini",
     )
-    result = runtime.run(_context(), root_prompt="Recover the failing dependency.")
+    result = runtime.run(_bundle(), root_prompt="Recover the failing dependency.")
 
     assert result == "compiler dependency missing"
     assert calls[0]["model"] == "openai/gpt-4.1-mini"
@@ -186,13 +186,13 @@ def test_runtime_depth_one_subcalls_cannot_recurse_further(
         [
             (
                 "```repl\n"
-                "answer = rlm_query('nested', context.trace(0))\n"
+                "answer = bundle_query('nested', bundle.trace(0))\n"
                 "print(answer)\n"
                 "```"
             ),
             (
                 "```repl\n"
-                "nested = rlm_query('too deep')\n"
+                "nested = bundle_query('too deep')\n"
                 "print(nested)\n"
                 "FINAL_VAR(nested)\n"
                 "```"
@@ -202,18 +202,18 @@ def test_runtime_depth_one_subcalls_cannot_recurse_further(
     )
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.runtime.generate_text",
+        "tokentrim.consolidator.engine.generate_text",
         lambda **kwargs: next(responses),
     )
 
-    result = LocalRLMRuntime(
+    result = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
         max_depth=1,
-    ).run(_context(), root_prompt="Test recursive limits.")
+    ).run(_bundle(), root_prompt="Test recursive limits.")
 
-    assert result == "Error: rlm_query depth limit reached."
+    assert result == "Error: bundle_query depth limit reached."
 
 
 def test_runtime_continues_after_unresolved_final_var(
@@ -231,14 +231,14 @@ def test_runtime_continues_after_unresolved_final_var(
         calls.append(kwargs["messages"])
         return next(responses)
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+    monkeypatch.setattr("tokentrim.consolidator.engine.generate_text", fake_generate_text)
 
-    runtime = LocalRLMRuntime(
+    runtime = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
     )
-    result = runtime.run(_context(), root_prompt="Keep going after a missing variable.")
+    result = runtime.run(_bundle(), root_prompt="Keep going after a missing variable.")
 
     assert result == "remember the runbook"
     assert len(calls) == 2
@@ -252,8 +252,8 @@ def test_runtime_subcall_limit_breaches_fail_safely(
         [
             (
                 "```repl\n"
-                "first = rlm_query('one')\n"
-                "second = rlm_query('two')\n"
+                "first = bundle_query('one')\n"
+                "second = bundle_query('two')\n"
                 "print(first)\n"
                 "print(second)\n"
                 "```"
@@ -264,19 +264,19 @@ def test_runtime_subcall_limit_breaches_fail_safely(
     )
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.runtime.generate_text",
+        "tokentrim.consolidator.engine.generate_text",
         lambda **kwargs: next(responses),
     )
 
-    runtime = LocalRLMRuntime(
+    runtime = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
         max_subcalls=1,
     )
-    result = runtime.run(_context(), root_prompt="Test subcall limits.")
+    result = runtime.run(_bundle(), root_prompt="Test subcall limits.")
 
-    assert result == "Error: rlm_query subcall limit reached."
+    assert result == "Error: bundle_query subcall limit reached."
     subcall_ops = [
         operation
         for operation in runtime.trajectory["iterations"][0]["code_blocks"][0]["operations"]
@@ -293,7 +293,7 @@ def test_runtime_llm_query_uses_plain_generate_text(
         [
             (
                 "```repl\n"
-                "memory_block = llm_query('Summarize the context in five words.')\n"
+                "memory_block = llm_query('Summarize the bundle in five words.')\n"
                 "print(memory_block)\n"
                 "```"
             ),
@@ -306,18 +306,18 @@ def test_runtime_llm_query_uses_plain_generate_text(
         calls.append(kwargs)
         return next(responses)
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+    monkeypatch.setattr("tokentrim.consolidator.engine.generate_text", fake_generate_text)
 
-    result = LocalRLMRuntime(
+    result = LocalConsolidatorRuntime(
         model="claude-3-5-sonnet",
         backend="anthropic",
         max_iterations=2,
-    ).run(_context(), root_prompt="Summarize the context.")
+    ).run(_bundle(), root_prompt="Summarize the bundle.")
 
     assert result == "five word memory summary"
     assert calls[0]["model"] == "anthropic/claude-3-5-sonnet"
     assert calls[1]["messages"] == [
-        {"role": "user", "content": "Summarize the context in five words."}
+        {"role": "user", "content": "Summarize the bundle in five words."}
     ]
 
 
@@ -338,13 +338,13 @@ def test_runtime_surfaces_python_errors_in_follow_up_prompt(
             observed_errors.append(messages[-2]["content"])
         return next(responses)
 
-    monkeypatch.setattr("tokentrim.transforms.rlm.runtime.generate_text", fake_generate_text)
+    monkeypatch.setattr("tokentrim.consolidator.engine.generate_text", fake_generate_text)
 
-    result = LocalRLMRuntime(
+    result = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=2,
-    ).run(_context(), root_prompt="Handle the exception.")
+    ).run(_bundle(), root_prompt="Handle the exception.")
 
     assert result == "resolved after seeing the error"
     assert any("NameError" in message for message in observed_errors)
@@ -356,20 +356,43 @@ def test_runtime_errors_after_iteration_limit_without_plain_text_fallback(
     responses = iter(["```repl\nx = 1\n```"])
 
     monkeypatch.setattr(
-        "tokentrim.transforms.rlm.runtime.generate_text",
+        "tokentrim.consolidator.engine.generate_text",
         lambda **kwargs: next(responses),
     )
 
-    runtime = LocalRLMRuntime(
+    runtime = LocalConsolidatorRuntime(
         model="gpt-4.1-mini",
         backend="openai",
         max_iterations=1,
     )
-    with pytest.raises(RLMExecutionError) as exc_info:
-        runtime.run(_context(), root_prompt="Stop after the iteration limit.")
+    with pytest.raises(ConsolidatorRuntimeError) as exc_info:
+        runtime.run(_bundle(), root_prompt="Stop after the iteration limit.")
 
     assert "max iterations" in str(exc_info.value)
     assert len(runtime.trajectory["iterations"]) == 1
+
+
+def test_runtime_accepts_direct_json_final_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tokentrim.consolidator.engine.generate_text",
+        lambda **kwargs: (
+            '{'
+            '"user_upserts":[],"org_upserts":[],"user_archives":[],"org_archives":[],'
+            '"merge_operations":[],"rationale":["enough evidence"],"source_refs":["openai_agents:trace_1"]'
+            '}'
+        ),
+    )
+
+    runtime = LocalConsolidatorRuntime(
+        model="gpt-4.1-mini",
+        backend="openai",
+        max_iterations=1,
+    )
+    result = runtime.run(_bundle(), root_prompt="Return the durable plan directly.")
+
+    assert '"rationale":["enough evidence"]' in result
 
 
 @pytest.mark.parametrize(

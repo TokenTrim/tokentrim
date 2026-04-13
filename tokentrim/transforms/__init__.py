@@ -2,11 +2,12 @@
 
 from tokentrim.transforms.base import Transform
 from tokentrim.transforms.compaction import CompactConversation, MicrocompactMessages
-from tokentrim.transforms.rlm import RetrieveMemory
+from tokentrim.transforms.memory import AgentAwareMemory, InjectMemory
 
 __all__ = [
+    "AgentAwareMemory",
     "CompactConversation",
+    "InjectMemory",
     "MicrocompactMessages",
-    "RetrieveMemory",
     "Transform",
 ]
