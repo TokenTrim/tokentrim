@@ -38,6 +38,13 @@ _REPAIR_VERBS = (
     "update",
     "switch",
 )
+_SPECULATIVE_PREFIXES = (
+    "i will ",
+    "next, i will ",
+    "i'll ",
+    "we will ",
+    "the next step is ",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +58,15 @@ class TracePatternCandidate:
     source_refs: tuple[str, ...]
     metadata: dict[str, object]
     rationale: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteCommandEvent:
+    trace: TokentrimTraceRecord
+    span: TokentrimSpanRecord
+    command: str
+    analysis: str
+    terminal_output: str
 
 
 def synthesize_trace_memory_plan(
@@ -192,46 +208,68 @@ def _collect_failure_recovery_candidates(
 def _collect_command_failure_insight_candidates(
     consolidation_input: ConsolidationInput,
 ) -> tuple[TracePatternCandidate, ...]:
-    grouped: dict[str, list[tuple[TokentrimTraceRecord, TokentrimSpanRecord, str, str, str]]] = defaultdict(list)
+    grouped: dict[str, list[tuple[ExecuteCommandEvent, str, str, ExecuteCommandEvent | None]]] = defaultdict(list)
 
     for trace in consolidation_input.traces:
         if not isinstance(trace, TokentrimTraceRecord):
             continue
-        for span in trace.spans:
-            if span.kind != "function":
-                continue
-            event = _extract_execute_command_event(span)
-            if event is None:
-                continue
-            command, analysis, terminal_output = event
+        events = _extract_execute_command_events(trace)
+        for index, event in enumerate(events):
+            command = event.command
+            analysis = event.analysis
+            terminal_output = event.terminal_output
             if not _looks_like_failure_output(terminal_output):
                 continue
-            if not _looks_like_repair_attempt(command, analysis):
-                continue
             issue_summary = _summarize_failure_output(terminal_output)
-            repair_summary = _summarize_repair(analysis=analysis, command=command)
+            if _is_generic_issue_summary(issue_summary):
+                continue
+            recovery_event = _find_later_successful_command(events=events, failed_index=index)
+            if recovery_event is not None:
+                if not _looks_like_repair_attempt(recovery_event.command, recovery_event.analysis):
+                    continue
+                repair_summary = _summarize_repair(
+                    analysis=recovery_event.analysis,
+                    command=recovery_event.command,
+                )
+            else:
+                if not _looks_like_repair_attempt(command, analysis):
+                    continue
+                repair_summary = _summarize_repair(analysis=analysis, command=command)
+                if _repair_summary_is_speculative(repair_summary):
+                    continue
             signature = _normalize_signature(f"{trace.workflow_name}|{issue_summary}")
-            grouped[signature].append((trace, span, issue_summary, repair_summary, command))
+            grouped[signature].append((event, issue_summary, repair_summary, recovery_event))
 
     candidates: list[TracePatternCandidate] = []
     for signature, matches in grouped.items():
-        exemplar_trace, exemplar_span, issue_summary, repair_summary, command = matches[-1]
+        exemplar_event, issue_summary, repair_summary, recovery_event = matches[-1]
+        exemplar_trace = exemplar_event.trace
         count = len(matches)
         scope, subject_id = _select_scope(consolidation_input=consolidation_input, evidence_count=count)
+        representative_command = recovery_event.command if recovery_event is not None else exemplar_event.command
         source_refs = tuple(
-            dict.fromkeys(ref for trace, span, _, _, _ in matches for ref in (trace.trace_id, span.span_id))
+            dict.fromkeys(
+                ref
+                for event, _, _, recovery in matches
+                for ref in (
+                    event.trace.trace_id,
+                    event.span.span_id,
+                    *((recovery.span.span_id,) if recovery is not None else ()),
+                )
+            )
         )
+        trajectory_state = "verified_recovery" if recovery_event is not None else "local_repair_hint"
         candidates.append(
             TracePatternCandidate(
                 scope=scope,
                 subject_id=subject_id,
                 dedupe_key=f"trace:{scope}:repair:{signature}",
                 kind=TRACE_FAILURE_RECOVERY_KIND,
-                salience=0.81 if count > 1 else 0.72,
+                salience=(0.88 if recovery_event is not None else 0.78) if count > 1 else (0.8 if recovery_event is not None else 0.68),
                 content=(
                     f"For workflow '{exemplar_trace.workflow_name}', when command output shows '{issue_summary}', "
                     f"a useful repair direction is: {repair_summary}. "
-                    f"Representative command: {command}."
+                    f"Representative command: {representative_command}."
                 ),
                 source_refs=source_refs,
                 metadata={
@@ -240,10 +278,12 @@ def _collect_command_failure_insight_candidates(
                     "issue_summary": issue_summary,
                     "repair_summary": repair_summary,
                     "evidence_count": count,
+                    "trajectory_state": trajectory_state,
                 },
                 rationale=(
-                    "Promoted a trace-derived repair heuristic because a failing command included a clear "
-                    f"error signature and an explicit remediation attempt. Evidence count: {count}."
+                    "Promoted a trajectory-derived repair heuristic because a failing command included a specific "
+                    f"error signature and the later command sequence provided {trajectory_state.replace('_', ' ')}. "
+                    f"Evidence count: {count}."
                 ),
             )
         )
@@ -349,7 +389,18 @@ def _render_failure_recovery_content(
     )
 
 
-def _extract_execute_command_event(span: TokentrimSpanRecord) -> tuple[str, str, str] | None:
+def _extract_execute_command_events(trace: TokentrimTraceRecord) -> tuple[ExecuteCommandEvent, ...]:
+    events: list[ExecuteCommandEvent] = []
+    for span in trace.spans:
+        if span.kind != "function":
+            continue
+        event = _extract_execute_command_event(trace=trace, span=span)
+        if event is not None:
+            events.append(event)
+    return tuple(events)
+
+
+def _extract_execute_command_event(*, trace: TokentrimTraceRecord, span: TokentrimSpanRecord) -> ExecuteCommandEvent | None:
     data = span.data
     if data.get("name") != "execute_command":
         return None
@@ -360,7 +411,13 @@ def _extract_execute_command_event(span: TokentrimSpanRecord) -> tuple[str, str,
     terminal_output = _coerce_string(output_payload.get("terminal_output"))
     if not command or not terminal_output:
         return None
-    return command, analysis, terminal_output
+    return ExecuteCommandEvent(
+        trace=trace,
+        span=span,
+        command=command,
+        analysis=analysis,
+        terminal_output=terminal_output,
+    )
 
 
 def _parse_mapping_payload(payload: object) -> dict[str, Any]:
@@ -393,6 +450,8 @@ def _summarize_failure_output(terminal_output: str) -> str:
     for line in terminal_output.splitlines():
         stripped = line.strip()
         lowered = stripped.lower()
+        if stripped.startswith("E:"):
+            return stripped
         if "fatal error:" in lowered:
             return stripped
         if "no such file or directory" in lowered:
@@ -409,6 +468,28 @@ def _summarize_repair(*, analysis: str, command: str) -> str:
     if summary:
         return summary.rstrip(".")
     return f"run `{command}`"
+
+
+def _find_later_successful_command(
+    *,
+    events: tuple[ExecuteCommandEvent, ...],
+    failed_index: int,
+) -> ExecuteCommandEvent | None:
+    for candidate in events[failed_index + 1 :]:
+        if _looks_like_failure_output(candidate.terminal_output):
+            continue
+        return candidate
+    return None
+
+
+def _is_generic_issue_summary(summary: str) -> bool:
+    lowered = summary.strip().lower()
+    return lowered.startswith("[exit_code]") or lowered in {"command failure", "failed", "error"}
+
+
+def _repair_summary_is_speculative(summary: str) -> bool:
+    lowered = summary.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _SPECULATIVE_PREFIXES)
 
 
 def _normalize_signature(value: str) -> str:

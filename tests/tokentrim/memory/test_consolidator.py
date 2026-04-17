@@ -160,6 +160,90 @@ def _complete_execute_command_trace(
     trace_store.complete_trace(trace_id=trace_id)
 
 
+def _complete_execute_command_trajectory_trace(
+    trace_store: InMemoryTraceStore,
+    *,
+    trace_id: str,
+    user_id: str = "user_1",
+    session_id: str = "session_1",
+) -> None:
+    trace = _trace(trace_id, user_id=user_id, session_id=session_id)
+    trace_store.create_trace(user_id=user_id, session_id=session_id, trace=trace)
+    trace_store.append_span(
+        trace_id=trace_id,
+        span=TokentrimSpanRecord(
+            span_id=f"{trace_id}:execute_command:1",
+            trace_id=trace_id,
+            source="openai_agents",
+            kind="function",
+            name="execute_command",
+            source_span_id=f"{trace_id.removeprefix('openai_agents:')}:execute_command:1",
+            parent_id=None,
+            started_at="2026-04-13T10:00:00Z",
+            ended_at="2026-04-13T10:00:05Z",
+            error=None,
+            metrics=None,
+            data={
+                "name": "execute_command",
+                "input": json.dumps(
+                    {
+                        "analysis": "Try downloading the source package.",
+                        "command": "apt-get source pmars",
+                        "duration_seconds": 20,
+                    }
+                ),
+                "output": repr(
+                    {
+                        "action": "execute_command",
+                        "assistant_text": "Try downloading the source package.",
+                        "command": "apt-get source pmars",
+                        "duration_seconds": 20.0,
+                        "terminal_output": "Reading package lists...\nE: You must put some 'deb-src' URIs in your sources.list\n[exit_code] 100",
+                    }
+                ),
+            },
+            raw_span={"id": f"{trace_id.removeprefix('openai_agents:')}:execute_command:1"},
+        ),
+    )
+    trace_store.append_span(
+        trace_id=trace_id,
+        span=TokentrimSpanRecord(
+            span_id=f"{trace_id}:execute_command:2",
+            trace_id=trace_id,
+            source="openai_agents",
+            kind="function",
+            name="execute_command",
+            source_span_id=f"{trace_id.removeprefix('openai_agents:')}:execute_command:2",
+            parent_id=None,
+            started_at="2026-04-13T10:00:06Z",
+            ended_at="2026-04-13T10:00:15Z",
+            error=None,
+            metrics=None,
+            data={
+                "name": "execute_command",
+                "input": json.dumps(
+                    {
+                        "analysis": "Add valid deb-src entries, update apt, and download the source package.",
+                        "command": "printf 'deb http://deb.debian.org/debian stable main contrib non-free\\ndeb-src http://deb.debian.org/debian stable main contrib non-free\\n' > /etc/apt/sources.list && apt-get update && apt-get source pmars",
+                        "duration_seconds": 30,
+                    }
+                ),
+                "output": repr(
+                    {
+                        "action": "execute_command",
+                        "assistant_text": "Add valid deb-src entries, update apt, and download the source package.",
+                        "command": "printf 'deb http://deb.debian.org/debian stable main contrib non-free\\ndeb-src http://deb.debian.org/debian stable main contrib non-free\\n' > /etc/apt/sources.list && apt-get update && apt-get source pmars",
+                        "duration_seconds": 30.0,
+                        "terminal_output": "Get:1 http://deb.debian.org/debian stable InRelease\nReading package lists...\ndpkg-source: info: extracting pmars\n[exit_code] 0",
+                    }
+                ),
+            },
+            raw_span={"id": f"{trace_id.removeprefix('openai_agents:')}:execute_command:2"},
+        ),
+    )
+    trace_store.complete_trace(trace_id=trace_id)
+
+
 def test_offline_consolidator_builds_input_from_trace_and_memory_scopes() -> None:
     memory_store = InMemoryMemoryStore()
     trace_store = InMemoryTraceStore()
@@ -327,6 +411,59 @@ def test_deterministic_consolidator_extracts_repair_memory_from_failed_command_t
         "openai_agents:trace_pmars",
         "openai_agents:trace_pmars:execute_command",
     )
+
+
+def test_deterministic_consolidator_prefers_trajectory_verified_repair() -> None:
+    memory_store = InMemoryMemoryStore()
+    trace_store = InMemoryTraceStore()
+    _complete_execute_command_trajectory_trace(trace_store, trace_id="openai_agents:trace_pmars")
+
+    result = run_session_consolidation(
+        memory_store=memory_store,
+        trace_store=trace_store,
+        session_id="session_1",
+        user_id="user_1",
+        org_id=None,
+        apply=False,
+        agent=DeterministicConsolidatorAgent(),
+    )
+
+    assert len(result.plan.user_upserts) == 1
+    upsert = result.plan.user_upserts[0]
+    assert "deb-src" in upsert.write.content
+    assert "printf 'deb http://deb.debian.org/debian stable" in upsert.write.content
+    assert upsert.write.metadata == {
+        "trace_pattern": "command_failure_insight",
+        "workflow_name": "code_agent",
+        "issue_summary": "E: You must put some 'deb-src' URIs in your sources.list",
+        "repair_summary": "Add valid deb-src entries, update apt, and download the source package",
+        "evidence_count": 1,
+        "trajectory_state": "verified_recovery",
+    }
+
+
+def test_deterministic_consolidator_skips_generic_exit_code_only_repairs() -> None:
+    memory_store = InMemoryMemoryStore()
+    trace_store = InMemoryTraceStore()
+    _complete_execute_command_trace(
+        trace_store,
+        trace_id="openai_agents:trace_generic",
+        analysis="I will fix this later.",
+        command="do-something",
+        terminal_output="$ do-something\n[exit_code] 2",
+    )
+
+    result = run_session_consolidation(
+        memory_store=memory_store,
+        trace_store=trace_store,
+        session_id="session_1",
+        user_id="user_1",
+        org_id=None,
+        apply=False,
+        agent=DeterministicConsolidatorAgent(),
+    )
+
+    assert result.plan.user_upserts == ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,7 +891,7 @@ def test_agentic_consolidator_agent_keeps_trace_synthesis_when_runtime_returns_n
     stored = memory_store.list_memories(scope="user", subject_id="user_1")
     assert len(stored) == 1
     assert "X11/Xlib.h" in stored[0].content
-    assert any("trace-derived repair heuristic" in item for item in result.plan.rationale)
+    assert any("trajectory-derived repair heuristic" in item for item in result.plan.rationale)
 
 
 def test_agentic_consolidator_agent_accepts_scalar_rationale_and_source_refs(monkeypatch) -> None:
