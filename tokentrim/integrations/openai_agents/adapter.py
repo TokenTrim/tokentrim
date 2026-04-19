@@ -40,6 +40,8 @@ class OpenAIAgentsAdapter(IntegrationAdapter["RunConfig"]):
         if not requires_adapter(
             token_budget=self._options.token_budget,
             steps=self._options.steps,
+            memory_store=self._options.memory_store,
+            agent_aware_memory=self._options.agent_aware_memory,
             trace_store=self._options.trace_store,
         ):
             return effective_run_config
@@ -47,6 +49,8 @@ class OpenAIAgentsAdapter(IntegrationAdapter["RunConfig"]):
         should_trim = requires_trim_hooks(
             token_budget=self._options.token_budget,
             steps=self._options.steps,
+            memory_store=self._options.memory_store,
+            agent_aware_memory=self._options.agent_aware_memory,
         )
         effective_options = (
             replace(

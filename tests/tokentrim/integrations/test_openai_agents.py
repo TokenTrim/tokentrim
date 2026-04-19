@@ -1,34 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 
 import pytest
 
-agents = pytest.importorskip("agents")
+if importlib.util.find_spec("agents") is None:
+    pytestmark = pytest.mark.skip(reason="agents not installed")
+else:
+    from agents import Agent, RunConfig
+    from agents.handoffs import HandoffInputData
+    from agents.run import CallModelData, ModelInputData
 
-from agents import Agent, RunConfig
-from agents.handoffs import HandoffInputData
-from agents.run import CallModelData, ModelInputData
+    from tokentrim import Tokentrim
+    from tokentrim.integrations.base import IntegrationAdapter
+    from tokentrim.integrations.openai_agents import (
+        OpenAIAgentsAdapter,
+        OpenAIAgentsOptions,
+    )
+    from tokentrim.memory import InMemoryMemoryStore, MemoryWrite
+    from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
+    from tokentrim.tracing import InMemoryTraceStore
+    from tokentrim.transforms import CompactConversation
+    from tokentrim.transforms.base import Transform
+    from tokentrim.pipeline.requests import PipelineRequest
+    from tokentrim.types.state import PipelineState
 
-from tokentrim import Tokentrim
-from tokentrim.transforms import CompactConversation, FilterMessages, RetrieveMemory
-from tokentrim.integrations.base import IntegrationAdapter
-from tokentrim.integrations.openai_agents import (
-    OpenAIAgentsAdapter,
-    OpenAIAgentsOptions,
-)
-from tokentrim.integrations.openai_agents.tracing import TOKENTRIM_TRACE_METADATA_KEY
-from tokentrim.tracing import InMemoryTraceStore
+    class TestFilterTransform(Transform):
+        @property
+        def name(self) -> str:
+            return "test-filter"
 
-
-class InMemoryStore:
-    def retrieve(self, *, user_id: str, session_id: str) -> str | None:
-        if user_id == "u1" and session_id == "s1":
-            return "stored context"
-        return None
-
-
+        def run(self, state: PipelineState, request: PipelineRequest) -> PipelineState:
+            del request
+            filtered = [message for message in state.context if message["content"].strip()]
+            return PipelineState(context=filtered, tools=state.tools)
 def _message_items(count: int) -> list[dict[str, str]]:
     return [{"role": "user", "content": f"message {index} " + ("x" * 40)} for index in range(count)]
 
@@ -75,9 +82,43 @@ def test_openai_agents_adapter_compacts_plain_text_inputs(
     assert result.input[1:] == input_items[-6:]
 
 
+def test_openai_agents_adapter_injects_memory_by_default_when_store_is_present() -> None:
+    client = Tokentrim()
+    memory_store = InMemoryMemoryStore()
+    memory_store.write_session_memory(
+        session_id="s1",
+        write=MemoryWrite(
+            content="Use the repository root when debugging command failures",
+            kind="active_state",
+        ),
+    )
+    wrapped = OpenAIAgentsAdapter(
+        options=OpenAIAgentsOptions(
+            user_id="u1",
+            session_id="s1",
+            org_id="o1",
+            memory_store=memory_store,
+        )
+    ).wrap(client)
+    payload = CallModelData(
+        model_data=ModelInputData(
+            input=[{"role": "user", "content": "debug the command failure"}],
+            instructions="answer briefly",
+        ),
+        agent=Agent(name="assistant"),
+        context=None,
+    )
+
+    result = asyncio.run(wrapped.call_model_input_filter(payload))
+
+    assert result.input[0]["role"] == "system"
+    assert "Injected memory:" in str(result.input[0]["content"])
+    assert "repository root" in str(result.input[0]["content"])
+
+
 def test_openai_agents_adapter_implements_integration_adapter() -> None:
     client = Tokentrim()
-    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(FilterMessages(),)))
+    adapter = OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(TestFilterTransform(),)))
 
     wrapped = adapter.wrap(client)
 
@@ -122,7 +163,7 @@ def test_openai_agents_adapter_requires_user_and_session_for_trace_store() -> No
 def test_openai_agents_adapter_chains_existing_model_filter() -> None:
     client = Tokentrim()
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(steps=(FilterMessages(),))
+        options=OpenAIAgentsOptions(steps=(TestFilterTransform(),))
     ).wrap(
         client,
         config=RunConfig(
@@ -157,7 +198,7 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
         return [*history_items, {"role": "assistant", "content": "   "}, *new_items]
 
     wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(steps=(FilterMessages(),))
+        options=OpenAIAgentsOptions(steps=(TestFilterTransform(),))
     ).wrap(
         client,
         config=RunConfig(session_input_callback=session_callback),
@@ -176,37 +217,12 @@ def test_openai_agents_adapter_chains_existing_session_callback() -> None:
     ]
 
 
-def test_openai_agents_adapter_applies_rlm_to_handoff_history() -> None:
-    client = Tokentrim()
-    wrapped = OpenAIAgentsAdapter(
-        options=OpenAIAgentsOptions(
-            user_id="u1",
-            session_id="s1",
-            steps=(RetrieveMemory(memory_store=InMemoryStore()),),
-        )
-    ).wrap(client)
-    payload = HandoffInputData(
-        input_history="hello",
-        pre_handoff_items=(),
-        new_items=(),
-    )
-
-    result = asyncio.run(wrapped.handoff_input_filter(payload))
-
-    assert result.input_history == (
-        {"role": "system", "content": "stored context"},
-        {"role": "user", "content": "hello"},
-    )
-    assert result.pre_handoff_items == ()
-    assert result.new_items == ()
-
-
 def test_openai_agents_adapter_preserves_rich_response_items() -> None:
     client = Tokentrim()
     wrapped = OpenAIAgentsAdapter(
         options=OpenAIAgentsOptions(
             token_budget=1,
-            steps=(FilterMessages(), CompactConversation()),
+            steps=(TestFilterTransform(), CompactConversation()),
         )
     ).wrap(client)
     input_items = [
@@ -236,7 +252,7 @@ def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
     client = Tokentrim()
 
     wrapped = client.wrap_integration(
-        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(FilterMessages(),)))
+        OpenAIAgentsAdapter(options=OpenAIAgentsOptions(steps=(TestFilterTransform(),)))
     )
 
     assert isinstance(wrapped, RunConfig)
@@ -246,7 +262,7 @@ def test_client_wrap_integration_accepts_openai_agents_adapter() -> None:
 def test_client_openai_agents_config_defaults_to_call_model_hook_only() -> None:
     client = Tokentrim()
 
-    wrapped = client.openai_agents_config(steps=(FilterMessages(),))
+    wrapped = client.openai_agents_config(steps=(TestFilterTransform(),))
 
     assert isinstance(wrapped, RunConfig)
     assert wrapped.call_model_input_filter is not None
@@ -258,7 +274,7 @@ def test_client_openai_agents_config_supports_advanced_opt_in_hooks() -> None:
     client = Tokentrim()
 
     wrapped = client.openai_agents_config(
-        steps=(FilterMessages(),),
+        steps=(TestFilterTransform(),),
         apply_to_session_history=True,
         apply_to_handoffs=True,
     )
@@ -272,7 +288,7 @@ def test_client_openai_agents_config_supports_advanced_opt_in_hooks() -> None:
 def test_compose_to_openai_agents_builds_run_config() -> None:
     client = Tokentrim()
 
-    wrapped = client.compose(FilterMessages()).to_openai_agents(token_budget=100)
+    wrapped = client.compose(TestFilterTransform()).to_openai_agents(token_budget=100)
 
     assert isinstance(wrapped, RunConfig)
     assert wrapped.call_model_input_filter is not None

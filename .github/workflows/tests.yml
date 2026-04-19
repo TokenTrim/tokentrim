@@ -33,4 +33,5 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: .
-        run: pytest -q
+          TOKENTRIM_LIVE_COMPACTION: "0"
+        run: pytest -q -m "not live"

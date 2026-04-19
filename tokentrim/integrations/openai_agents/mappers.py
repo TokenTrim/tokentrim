@@ -53,7 +53,10 @@ def trim_input_items(
         messages,
         user_id=options.user_id,
         session_id=options.session_id,
+        org_id=options.org_id,
         token_budget=options.token_budget,
+        memory_store=options.memory_store,
+        agent_aware_memory=options.agent_aware_memory,
         trace_store=options.trace_store,
         pipeline_tracer=options.pipeline_tracer,
     )

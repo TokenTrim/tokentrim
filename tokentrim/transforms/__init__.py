@@ -1,19 +1,13 @@
 """Tokentrim transforms."""
 
 from tokentrim.transforms.base import Transform
-from tokentrim.transforms.compress_tools import CompressToolDescriptions
-from tokentrim.transforms.compaction import CompactConversation
-from tokentrim.transforms.create_tools import CreateTools
-from tokentrim.transforms.filter import FilterMessages
-from tokentrim.transforms.rlm import MemoryStore, NoOpMemoryStore, RetrieveMemory
+from tokentrim.transforms.compaction import CompactConversation, MicrocompactMessages
+from tokentrim.transforms.memory import AgentAwareMemory, InjectMemory
 
 __all__ = [
+    "AgentAwareMemory",
     "CompactConversation",
-    "CompressToolDescriptions",
-    "CreateTools",
-    "FilterMessages",
-    "MemoryStore",
-    "NoOpMemoryStore",
-    "RetrieveMemory",
+    "InjectMemory",
+    "MicrocompactMessages",
     "Transform",
 ]

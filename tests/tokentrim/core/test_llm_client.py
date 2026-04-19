@@ -55,6 +55,7 @@ def test_generate_text_supports_dict_style_response(
     result = generate_text(model="test-model", messages=[])
 
     assert result == "hello"
+    assert not hasattr(sys.modules["litellm"], "suppress_debug_info")
 
 
 def test_generate_text_supports_object_style_response(
@@ -75,7 +76,32 @@ def test_generate_text_supports_object_style_response(
     assert result == "world"
 
 
+@pytest.mark.parametrize("model", ["gpt-5", "gpt-5.4-nano", "openai/gpt-5", "openai/gpt-5.4-nano"])
 def test_generate_text_omits_temperature_for_gpt5_models(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def completion(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+
+    result = generate_text(
+        model=model,
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0.0,
+    )
+
+    assert result == "ok"
+    assert captured["model"] == model
+    assert captured["messages"] == [{"role": "user", "content": "hello"}]
+    assert "temperature" not in captured
+
+
+def test_generate_text_forwards_completion_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -87,15 +113,17 @@ def test_generate_text_omits_temperature_for_gpt5_models(
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
     result = generate_text(
-        model="gpt-5",
+        model="openai/mercury-2",
         messages=[{"role": "user", "content": "hello"}],
-        temperature=0.0,
+        completion_options={
+            "api_base": "https://api.inceptionlabs.ai/v1",
+            "api_key": "test-key",
+        },
     )
 
     assert result == "ok"
-    assert captured["model"] == "gpt-5"
-    assert captured["messages"] == [{"role": "user", "content": "hello"}]
-    assert "temperature" not in captured
+    assert captured["api_base"] == "https://api.inceptionlabs.ai/v1"
+    assert captured["api_key"] == "test-key"
 
 
 def test_generate_text_raises_when_response_has_no_content(
@@ -113,3 +141,30 @@ def test_generate_text_raises_when_response_has_no_content(
         generate_text(model="test-model", messages=[])
 
     assert "did not contain text content" in str(exc_info.value)
+
+
+def test_generate_text_temporarily_suppresses_litellm_debug_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    litellm_module = SimpleNamespace(
+        suppress_debug_info=False,
+        set_verbose=True,
+    )
+
+    def completion(**kwargs):
+        observed["kwargs"] = kwargs
+        observed["suppress_debug_info"] = litellm_module.suppress_debug_info
+        observed["set_verbose"] = litellm_module.set_verbose
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    litellm_module.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", litellm_module)
+
+    result = generate_text(model="openai/gpt-5.4-nano", messages=[{"role": "user", "content": "hi"}])
+
+    assert result == "ok"
+    assert observed["suppress_debug_info"] is True
+    assert observed["set_verbose"] is False
+    assert litellm_module.suppress_debug_info is False
+    assert litellm_module.set_verbose is True

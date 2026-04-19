@@ -6,17 +6,38 @@ from typing import Any
 from tokentrim.errors.base import TokentrimError
 
 
-def requires_trim_hooks(*, token_budget: int | None, steps: tuple[Any, ...]) -> bool:
-    return token_budget is not None or bool(steps)
+def requires_trim_hooks(
+    *,
+    token_budget: int | None,
+    steps: tuple[Any, ...],
+    memory_store: Any | None = None,
+    agent_aware_memory: bool = False,
+) -> bool:
+    return (
+        token_budget is not None
+        or bool(steps)
+        or memory_store is not None
+        or agent_aware_memory
+    )
 
 
 def requires_adapter(
     *,
     token_budget: int | None,
     steps: tuple[Any, ...],
+    memory_store: Any | None,
+    agent_aware_memory: bool,
     trace_store: Any | None,
 ) -> bool:
-    return requires_trim_hooks(token_budget=token_budget, steps=steps) or trace_store is not None
+    return (
+        requires_trim_hooks(
+            token_budget=token_budget,
+            steps=steps,
+            memory_store=memory_store,
+            agent_aware_memory=agent_aware_memory,
+        )
+        or trace_store is not None
+    )
 
 
 def load_agents_sdk() -> tuple[type[Any], type[Any], type[Any]]:

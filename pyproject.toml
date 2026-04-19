@@ -18,6 +18,9 @@ dependencies = [
     "tiktoken>=0.6",
 ]
 
+[project.scripts]
+tokentrim = "tokentrim.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "mypy",
@@ -29,6 +32,8 @@ dev = [
 openai-agents = [
     "openai-agents>=0.6.4",
 ]
+rlm = [
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -37,3 +42,6 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests/tokentrim"]
 addopts = "--cov=tokentrim --cov-report=term-missing --cov-report=term --cov-fail-under=80"
+markers = [
+    "live: opt-in tests that call real model providers and require local credentials",
+]

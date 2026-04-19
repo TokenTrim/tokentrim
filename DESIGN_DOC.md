@@ -1,70 +1,83 @@
 # Tokentrim Design Doc
 
-## Scope
+## Purpose
 
-This document describes Tokentrim's current architecture, boundaries, and
-extension model.
+Tokentrim is a local, in-process SDK for managing model context before
+execution. It does not run as a hosted service. Its current product shape is:
 
-## Core Goals
+- compaction for long-running coding and agent workflows
+- optional persisted traces for debugging and integrations
+- thin integrations that reuse the same core runtime
 
-- local, in-process SDK (no hosted Tokentrim service)
-- one primary execution pattern: `compose(...).apply(...)`
-- explicit transform composition
-- inspectable runs through stable synchronous and persisted trace models
-- thin integration adapters that reuse the same core pipeline
+The system is designed around one rule: context management should happen
+through one compose-first pipeline, not through several unrelated APIs.
 
-## Public API
+## User Model
 
-Tokentrim exposes two primary user-facing objects:
+From a user perspective, Tokentrim has two layers:
 
-- `Tokentrim` in `tokentrim/client.py`
-- `ComposedPipeline` returned by `Tokentrim.compose(...)`
+1. live context
+   - the prompt window about to be sent to the model
+   - recent messages, working state, compacted history
+2. traces
+   - execution history
+   - useful for debugging and integrations
 
-Execution shape:
+These are intentionally separate:
 
-1. create client with shared defaults (tokenizer, default token budget)
+- compaction keeps the live prompt small
+- tracing records what happened
+
+## Core API
+
+Tokentrim exposes one primary execution pattern:
+
+- `Tokentrim(...).compose(*steps).apply(...)`
+
+Main public objects:
+
+- `Tokentrim`
+- `ComposedPipeline`
+- `CompactConversation`
+
+Supporting public subsystems:
+
+- `tokentrim.memory`
+- `tokentrim.consolidator`
+- `tokentrim.tracing`
+
+Typical execution shape:
+
+1. create a `Tokentrim` client with shared defaults such as `tokenizer`
 2. compose transform instances
 3. call `.apply(...)`
 4. receive one immutable `Result`
 
-There are no separate context/tools runner types. Both payload tracks use the
-same compose-first execution path and the same internal pipeline state.
+There are not separate context and tools runtimes. Both payload tracks flow
+through one shared `PipelineState`.
 
-For OpenAI Agents users, the primary integration path is:
+## Architectural Principles
 
-- `Tokentrim.compose(...).to_openai_agents(...)`
-
-This keeps integration wiring compose-first and avoids direct
-adapter/options construction in app code.
-
-Additional public helpers exist on `Tokentrim`:
-
-- `wrap_integration(adapter, config=...)` for generic adapter wiring
-- `openai_agents_config(...)` as a convenience wrapper around
-  `compose(*steps).to_openai_agents(...)`
-
-Tracing-related public types live under `tokentrim/tracing/`:
-
-- `TraceStore` / `InMemoryTraceStore`
-- `TokentrimTraceRecord` / `TokentrimSpanRecord`
-- `PipelineTracer` / `PipelineSpan`
+- local-first: no Tokentrim backend
+- compose-first: one primary way to use the system
+- explicit transforms: no hidden background optimizer
+- immutable results: the pipeline returns frozen outputs
+- subsystem boundaries: memory, tracing, and consolidator stay separate from compaction
 
 ## Package Layout
 
 | Path | Responsibility |
 | --- | --- |
-| `tokentrim/client.py` | Public facade and compose-first API |
-| `tokentrim/pipeline/requests.py` | Immutable request models (`PipelineRequest` plus compatibility wrappers) |
-| `tokentrim/pipeline/pipeline.py` | Unified execution runtime (`UnifiedPipeline`) |
+| `tokentrim/client.py` | Public facade and composed-pipeline entrypoint |
+| `tokentrim/pipeline/` | Request models and unified execution runtime |
 | `tokentrim/transforms/base.py` | Shared transform contract |
-| `tokentrim/transforms/filter/` | Message filtering transform |
 | `tokentrim/transforms/compaction/` | Conversation compaction transform |
-| `tokentrim/transforms/rlm/` | Retrieval-memory transform + memory store interface |
-| `tokentrim/transforms/compress_tools/` | Deterministic tool description compression |
-| `tokentrim/transforms/create_tools/` | Model-backed missing tool creation |
+| `tokentrim/transforms/memory.py` | Runtime memory injection and agent-aware memory transforms |
 | `tokentrim/core/copy_utils.py` | Clone/freeze helpers for payload safety |
 | `tokentrim/core/token_counting.py` | Token counting helpers |
 | `tokentrim/core/llm_client.py` | LiteLLM wrapper used by model-backed transforms |
+| `tokentrim/memory/` | Memory records, stores, formatting, querying, and session-memory write helpers |
+| `tokentrim/consolidator/` | Offline consolidation agents, planning/apply engine, and orchestration |
 | `tokentrim/tracing/` | Canonical persisted tracing models, store implementations, and pipeline tracing interfaces |
 | `tokentrim/types/` | Shared datatypes (`Message`, `Tool`, `PipelineState`, `Trace`, `StepTrace`, `Result`) |
 | `tokentrim/integrations/base.py` | Integration adapter contract |
@@ -75,7 +88,7 @@ Tracing-related public types live under `tokentrim/tracing/`:
 
 Tokentrim uses minimal payload types:
 
-- `Message`: `{role, content}`
+- `Message`: `{role, content}` with optional structured tool fields
 - `Tool`: `{name, description, input_schema}`
 - `PipelineState`: `{context: list[Message], tools: list[Tool]}`
 
@@ -85,22 +98,38 @@ Every run returns one `Result`:
 - `context: tuple[Message, ...]`
 - `tools: tuple[Tool, ...]`
 
-Both result payload fields are always present. Unused sides are empty tuples.
+Both result payloads are always present. Unused sides are empty tuples.
 
-Tokentrim also defines a separate persisted tracing model:
+### Canonical Message Shape
 
-- `TokentrimTraceRecord`
-- `TokentrimSpanRecord`
-- `TraceStore`
+Tokentrim treats conversation messages as one shared structure across all
+integrations. The minimum shape is still `{role, content}`, but integrations
+should preserve tool structure instead of flattening it into fake user turns.
 
-This persisted model is intentionally separate from `Result.trace`. `Result.trace`
-is the synchronous pipeline trace for one `compose(...).apply(...)` call.
-Persisted trace records are integration-facing history records intended for
-cross-run lookup by `user_id + session_id`.
+Canonical cases:
+
+1. user message
+   - `{"role": "user", "content": "..."}`
+2. assistant message
+   - `{"role": "assistant", "content": "..."}`
+3. assistant tool call
+   - `{"role": "assistant", "content": "...", "tool_calls": [...]}`
+4. tool result
+   - `{"role": "tool", "tool_call_id": "...", "name": "...", "content": "..."}`
+
+This matters for context management:
+
+- compaction can distinguish conversational turns from tool traffic
+- tool-output-specific microcompaction can operate structurally instead of
+  heuristically
+- trace-driven offline consolidation can preserve more useful signal
+
+Integrations should not encode tool output as `role="user"` unless the host SDK
+gives no way to preserve tool-call structure.
 
 ## Transform Contract
 
-All transforms implement `Transform` (`tokentrim/transforms/base.py`):
+All transforms implement `Transform` and provide:
 
 - `name`: stable identifier for tracing
 - optional `resolve(tokenizer_model=...)`: binding phase before run
@@ -134,10 +163,32 @@ Tracing is also centralized in the pipeline. Each executed step produces one
 `StepTrace` entry with item counts, token counts, and a changed/not-changed
 flag.
 
-The pipeline may also receive a `PipelineTracer`. When present, the runtime
-opens one integration-owned span per transform step around `resolved_step.run(...)`.
-This allows integrations to attach Tokentrim transform execution to their host
-tracing systems without importing host SDKs into the core pipeline.
+The default prompt asks for sections such as:
+
+- `Goal`
+- `Active State`
+- `Critical Artifacts`
+- `Open Risks`
+- `Next Step`
+- `Older Context`
+
+## Working State
+
+`tokentrim/working_state.py` holds the shared representation of active state.
+
+Its role is to capture the most operationally relevant information from the
+current run, such as:
+
+- goal
+- current step
+- active files
+- latest command
+- active error
+- constraints
+- next step
+
+This module is shared inside the compaction stack so the system does not rely
+on ad hoc parsing of rendered prompt text.
 
 ## Tracing Model
 
@@ -165,117 +216,114 @@ orders stored spans chronologically on read.
 
 ## Integration Boundary
 
-`IntegrationAdapter[ConfigT]` defines the integration contract:
+Integrations should stay thin and reuse the same core pipeline.
 
-- adapters expose `wrap(tokentrim, config=None) -> ConfigT`
-- adapters are responsible for attaching Tokentrim behavior to another SDK's
-  configuration or runtime hooks
-- adapters may map external payloads into Tokentrim payloads internally, but
-  that is an implementation detail rather than part of the abstract contract
+`IntegrationAdapter[ConfigT]` defines the adapter contract.
 
-OpenAI Agents integration is split by concern:
+Adapter responsibilities:
 
-- `options.py`: adapter options
-- `sdk.py`: SDK compatibility utilities
-- `mappers.py`: payload mapping logic
-- `hooks.py`: integration hook wiring
-- `pipeline_tracing.py`: OpenAI-backed implementation of `PipelineTracer`
-- `translator.py`: OpenAI-to-canonical trace/span translation
-- `tracing.py`: global processor installation, metadata routing, and store persistence
-- `adapter.py`: orchestrating adapter entrypoint
+- map host SDK inputs into Tokentrim payloads
+- attach Tokentrim behavior to host runtime hooks
+- preserve host behavior when Tokentrim is effectively disabled
+- optionally connect host tracing to `PipelineTracer`
 
-The current OpenAI Agents integration is still driven by message-oriented hook
-payloads. The adapter maps those into Tokentrim message inputs and ignores the
-tools side unless the caller explicitly supplies tools through another path.
+Current first-class integration:
 
-When `trace_store` is configured for OpenAI Agents:
+- `tokentrim/integrations/openai_agents/`
 
-- the adapter requires both `user_id` and `session_id`
-- the adapter installs a process-global OpenAI tracing processor
-- reserved Tokentrim routing metadata is injected into `RunConfig.trace_metadata`
-- only traces carrying that reserved metadata are persisted
-- Tokentrim transform execution is emitted as OpenAI SDK `custom` spans and
-  translated back into canonical `kind="transform"` persisted spans
-
-This means an OpenAI-backed stored trace can contain both native SDK spans
-(`agent`, `generation`, `response`, `function`, `handoff`, and so on) and
-Tokentrim transform spans such as `filter` or `compaction`.
+That integration is message-oriented in practice because of the host hook
+shapes. It can persist canonical traces and attach Tokentrim transform spans to
+the host trace stream.
 
 ## Error Model
 
-Tokentrim uses shared root errors in `tokentrim/errors/` and per-transform
-errors inside each transform package (`error.py`).
+Tokentrim uses:
+
+- shared root errors in `tokentrim/errors/`
+- transform-local or subsystem-local errors where needed
 
 Examples:
 
 - shared: `TokentrimError`, `BudgetExceededError`
 - transform-local: configuration/execution/output errors where needed
 
-## Testing Layout
+## Testing Strategy
 
-Tests mirror package structure under `tests/tokentrim/`:
+Tests mirror package structure under `tests/tokentrim/`.
 
-- `tests/tokentrim/core/`
-- `tests/tokentrim/pipeline/`
-- `tests/tokentrim/transforms/...`
-- `tests/tokentrim/integrations/`
+Key testing layers:
 
-Coverage is enforced in CI via pytest coverage thresholds.
+- unit tests for transforms and subsystem helpers
+- pipeline tests for composition and budget behavior
+- integration tests for adapter behavior
+- filesystem tests for memory and trace persistence
 
-## Add a New Transform
+Important behavior to keep covered:
 
-1. create `tokentrim/transforms/<name>/`
-2. add `transform.py`
-3. add `__init__.py` that re-exports the transform class
-4. add `error.py` only if the transform needs transform-specific exceptions
-5. implement `Transform` with:
-   - stable `name` for tracing
-   - a `run(state, request)` implementation that accepts and returns
-     `PipelineState`
-   - optional `resolve(...)` if configuration must be bound at runtime
-6. keep the transform focused on state transformation; cloning, freezing,
-   token accounting, tracing, and budget enforcement are handled by the
-   pipeline
-7. export from `tokentrim/transforms/__init__.py` if the transform is public
-8. add mirrored tests under `tests/tokentrim/transforms/<name>/`
-9. add or update pipeline-level tests if the transform depends on composition
-   order, budget behavior, or integration-specific wiring
+- compaction model failure behavior
+- working-state preservation
+- durable-memory retrieval and writing
+- trace persistence and round-trip loading
+- step ordering and per-step tracing
 
-Conventions used in this repository:
+## Extension Guidance
 
-- transform packages are small and self-contained
-- public transform names are exported from both the package-local `__init__.py`
-  and `tokentrim/transforms/__init__.py`
-- transform tests should cover happy path behavior, unchanged-side behavior,
-  and any transform-local failure modes
+### Add a New Transform
 
-## Add a New Integration
+1. add the transform implementation
+2. keep helper logic close to the transform unless it is a true shared concept
+3. export it from `tokentrim/transforms/__init__.py` only if it is public
+4. add mirrored tests
+5. add pipeline-level tests if order or budget behavior matters
 
-1. create `tokentrim/integrations/<name>/`
-2. define any integration-specific options/config helpers
-3. implement `IntegrationAdapter[ConfigT]`
-4. keep SDK-specific mapping and hook wiring inside the integration package
-5. reuse `Tokentrim.compose(...).apply(...)` or composed pipeline helpers
-   instead of reimplementing pipeline logic
-6. add tests under `tests/tokentrim/integrations/`
+### Add a New Subsystem Capability
 
-Integration design guidance:
+Use a subsystem instead of a transform when the new feature is primarily:
 
-- keep the adapter thin and delegate optimization behavior to the core pipeline
-- preserve host SDK behavior when Tokentrim is effectively disabled
-- document any host-SDK limitations or payload shapes that are intentionally
-  passed through unchanged
-- prefer implementing host-specific tracing through `PipelineTracer` rather than
-  importing host tracing APIs into `tokentrim/pipeline/`
+- storage
+- indexing
+- retrieval
+- tracing
+- policy infrastructure
+
+Memory and tracing follow this rule already.
+
+### Add a New Integration
+
+1. keep host SDK details inside `tokentrim/integrations/<name>/`
+2. reuse composed pipelines rather than reimplementing runtime logic
+3. isolate host-specific tracing behind adapter code and `PipelineTracer`
+4. test host mapping and pass-through behavior explicitly
+
+## Current Non-Goals
+
+The current architecture does not treat Tokentrim as:
+
+- a hosted memory service
+- a general agent framework
+- a background daemon
+- a vector database product
+- a knowledge graph system
+
+Those may become adjacent concerns later, but they are not part of the current
+core design.
+
+For the current OpenAI Agents integration, memory injection still runs on the
+core pipeline side. If a `memory_store` is present, Tokentrim injects memory
+before the model turn. If `agent_aware_memory=True`, Tokentrim also exposes the
+session-memory write tool to the agent. Persisted traces remain separate and
+feed the offline consolidator later.
 
 ## Contributor Notes
 
-For local test runs, install the package in editable mode or set
-`PYTHONPATH=.` before running pytest. CI installs with:
+Preferred local test flow:
 
 - `pip install -e ".[dev,openai-agents]"`
 - `PYTHONPATH=.` when running `pytest -q`
 
-For empty payload runs, prefer explicit `context=[]` or `tools=[]` when calling
-`compose(...).apply(...)`. A bare empty `payload=[]` is ambiguous under the
-current unified-state API.
+For ambiguous empty payloads, prefer:
+
+- `apply(context=[])`
+- `apply(tools=[])`
+
+instead of a bare empty positional payload.

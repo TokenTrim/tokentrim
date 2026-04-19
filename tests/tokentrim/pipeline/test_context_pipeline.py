@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from tokentrim.transforms.base import Transform
-from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
-from tokentrim.pipeline.requests import ContextRequest
 from tokentrim.errors.base import TokentrimError
 from tokentrim.errors.budget import BudgetExceededError
+from tokentrim.pipeline import PipelineRequest, UnifiedPipeline
+from tokentrim.pipeline.requests import ContextRequest
+from tokentrim.transforms import CompactConversation
+from tokentrim.transforms.base import Transform
 from tokentrim.types.state import PipelineState
 
 
@@ -38,27 +39,28 @@ def test_pipeline_runs_steps_in_order() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
+        org_id=None,
         token_budget=1000,
         steps=(
             RecorderStep("filter", "filter", calls),
             RecorderStep("compaction", "compaction", calls),
-            RecorderStep("rlm", "rlm", calls),
+            RecorderStep("memory_review", "memory_review", calls),
         ),
     )
 
     result = pipeline.run(request)
 
-    assert calls == ["filter", "compaction", "rlm"]
+    assert calls == ["filter", "compaction", "memory_review"]
     assert [message["content"] for message in result.context] == [
         "hello",
         "filter",
         "compaction",
-        "rlm",
+        "memory_review",
     ]
     assert [trace.step_name for trace in result.trace.steps] == [
         "filter",
         "compaction",
-        "rlm",
+        "memory_review",
     ]
     assert isinstance(result.context, tuple)
     assert result.trace.id
@@ -74,6 +76,7 @@ def test_pipeline_skips_disabled_steps() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id="user",
         session_id="session",
+        org_id=None,
         token_budget=1000,
         steps=(RecorderStep("filter", "filter", calls),),
     )
@@ -93,6 +96,7 @@ def test_pipeline_does_not_mutate_input_messages() -> None:
         messages=tuple(original),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(RecorderStep("filter", "filter", []),),
     )
@@ -111,6 +115,7 @@ def test_pipeline_result_is_independent_from_input_dicts() -> None:
         messages=tuple(original),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(),
     )
@@ -129,6 +134,7 @@ def test_pipeline_raises_when_final_budget_is_exceeded() -> None:
         messages=({"role": "user", "content": "x" * 80},),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=5,
         steps=(),
     )
@@ -147,6 +153,7 @@ def test_pipeline_raises_for_unknown_steps() -> None:
         messages=({"role": "user", "content": "hello"},),
         user_id=None,
         session_id=None,
+        org_id=None,
         token_budget=None,
         steps=(object(),),
     )
@@ -177,8 +184,10 @@ def test_pipeline_runs_mixed_steps_against_shared_request() -> None:
         tools=(),
         user_id="user",
         session_id="session",
+        org_id="org",
         task_hint="investigate",
         token_budget=1000,
+        memory_store=None,
         steps=(RecorderStep("filter", "filter", []), ToolRecorderStep()),
     )
 
@@ -191,3 +200,54 @@ def test_pipeline_runs_mixed_steps_against_shared_request() -> None:
     )
     assert result.tools == ({"name": "search", "description": "docs", "input_schema": {}},)
     assert [trace.step_name for trace in result.trace.steps] == ["filter", "tool-recorder"]
+
+
+def test_pipeline_uses_auto_budget_from_compaction_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = UnifiedPipeline(tokenizer_model=None)
+    request = ContextRequest(
+        messages=tuple({"role": "user", "content": "x" * 80} for _ in range(6)),
+        user_id=None,
+        session_id=None,
+        org_id=None,
+        token_budget=None,
+        steps=(
+            CompactConversation(
+                model="gpt-4o-mini",
+                keep_last=0,
+                context_window=120,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        "tokentrim.transforms.compaction.transform.generate_text",
+        lambda **kwargs: "summary",
+    )
+
+    result = pipeline.run(request)
+
+    assert result.trace.token_budget == 68
+    assert result.context[0]["role"] == "system"
+
+
+def test_pipeline_auto_budget_can_raise_budget_exceeded_without_explicit_budget() -> None:
+    pipeline = UnifiedPipeline(tokenizer_model=None)
+    request = ContextRequest(
+        messages=({"role": "user", "content": "x" * 400},),
+        user_id=None,
+        session_id=None,
+        org_id=None,
+        token_budget=None,
+        steps=(
+            CompactConversation(
+                model="gpt-4o-mini",
+                auto_budget=True,
+                context_window=60,
+            ),
+        ),
+    )
+
+    with pytest.raises(BudgetExceededError) as exc_info:
+        pipeline.run(request)
+
+    assert exc_info.value.budget == 34

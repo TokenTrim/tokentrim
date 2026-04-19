@@ -19,5 +19,7 @@ venv/
 env/
 ENV/
 .env
+.env.test
+tests/artifacts/
 
 .DS_Store
